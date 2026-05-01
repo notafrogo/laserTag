@@ -1,0 +1,46 @@
+/ {
+    aliases {
+        ir-pwm = &pwm0;
+        trigger-button = &trigger_button;
+    };
+
+    gpio_keys {
+        compatible = "gpio-keys";
+        trigger_button: trigger_button {
+            /* Trigger switch is on P0.29 */
+            gpios = <&gpio0 29 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+            label = "Trigger Button";
+        };
+    };
+};
+
+/*
+ * Disable uart0 to free up its pins (like P0.20) for other uses.
+ * This is safe because we are using the USB serial backend for logs.
+ */
+&uart0 {
+    status = "disabled";
+};
+
+&pwm0 {
+    status = "okay";
+    pinctrl-0 = <&pwm0_default>;
+    pinctrl-1 = <&pwm_sleep>;
+    pinctrl-names = "default", "sleep";
+};
+
+&pinctrl {
+    pwm0_default: pwm0_default {
+        group1 {
+            /* IR LED (PWM output) is on P0.20 */
+            psels = <NRF_PSEL(PWM_OUT0, 0, 20)>;
+        };
+    };
+
+    pwm_sleep: pwm_sleep {
+        group1 {
+            psels = <NRF_PSEL(PWM_OUT0, 0, 20)>;
+            low-power-enable;
+        };
+    };
+};

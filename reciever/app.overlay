@@ -1,0 +1,13 @@
+/ {
+    aliases {
+        irsensor = &ir_rx_pin;
+    };
+
+    gpio_inputs {
+        compatible = "gpio-keys";
+        ir_rx_pin: ir_rx_pin {
+            gpios = <&gpio0 8 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+            label = "VS1838B IR Receiver";
+        };
+    };
+};
