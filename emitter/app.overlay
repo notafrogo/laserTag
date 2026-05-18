@@ -32,14 +32,14 @@
 &pinctrl {
     pwm0_default: pwm0_default {
         group1 {
-            /* IR LED (PWM output) is on P0.20 */
-            psels = <NRF_PSEL(PWM_OUT0, 0, 20)>;
+            /* IR LED (PWM output, transistor-driven) is on P1.04 */
+            psels = <NRF_PSEL(PWM_OUT0, 1, 4)>;
         };
     };
 
     pwm_sleep: pwm_sleep {
         group1 {
-            psels = <NRF_PSEL(PWM_OUT0, 0, 20)>;
+            psels = <NRF_PSEL(PWM_OUT0, 1, 4)>;
             low-power-enable;
         };
     };

@@ -6,220 +6,27 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/byteorder.h>
-#include <zephyr/sys/util.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/uuid.h>
+
+#include <string.h>
 #include <stdio.h>
 
-#include "ble_gatt.h"
-#include "ir_handler.h"
+#include "protocol.h"
+#include "ir_protocol.h"
+#include "ble_phone.h"
+#include "ble_vest.h"
+#include "game_state.h"
+#include "mesh.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
-/* ----- State Machine & Variables ----- */
-enum emitter_state { STATE_UNCONFIGURED, STATE_CONFIGURED, STATE_ACTIVE };
-enum led_state { LED_DISCONNECTED, LED_FLASHING_ID, LED_CONNECTED_SOLID };
-
-struct emitter_config {
-    uint8_t user_id;
-    uint8_t damage;
-    uint16_t mag_size;
-    uint16_t fire_rate_ms;
-    uint16_t reload_speed_ms;
-    uint8_t full_auto;
-    uint8_t ammo_type;
-    uint16_t initial_total_ammo;
-};
-
-static struct emitter_config emitter_config;
-static enum emitter_state current_state = STATE_UNCONFIGURED;
-
-// Ammo Tracking
-static uint16_t current_mag_ammo = 0;
-static uint16_t current_total_ammo = 0;
-
-static atomic_t config_loaded = ATOMIC_INIT(0);
-static struct bt_conn *current_conn;
-
-// Persistence and LED Variables
-static bt_addr_le_t bound_peer_addr;
-static bool is_bound = false;
-static enum led_state current_led_state = LED_DISCONNECTED;
-static uint8_t connection_id_blinks = 1;
-static int flash_count_remaining = 0;
-static char adv_name[16] = "emitter";
-
-// Mechanics
-static bool trigger_ready = true; 
-static bool is_reloading = false;
-
-/* ----- BLE Service ----- */
-// See common/include/ble_gatt.h for GATT service definitions
-
-// Forward Declarations for Timers
-static struct k_work_delayable trigger_work; 
-static struct k_work_delayable reload_work;
-static struct k_work_delayable adv_work;
-
-/* ----- Coded PHY Variables & Callbacks ----- */
-static struct bt_le_ext_adv *coded_adv_set;
-static struct k_work_delayable stop_coded_adv_work;
-static atomic_t is_broadcasting = ATOMIC_INIT(0);
-
-static struct bt_le_scan_param scan_param = {
-    .type       = BT_LE_SCAN_TYPE_PASSIVE,
-    .options    = BT_LE_SCAN_OPT_CODED | BT_LE_SCAN_OPT_NO_1M,
-    .interval   = 0x00A0,
-    .window     = 0x00A0,
-};
-
-static void send_notification(uint8_t *data, uint16_t len);
-
-static void scan_recv(const struct bt_le_scan_recv_info *info, struct net_buf_simple *buf)
-{
-    LOG_INF("Received Coded PHY hit (or msg)! RSSI: %d dBm", info->rssi);
-    LOG_HEXDUMP_INF(buf->data, buf->len, "Coded PHY RX:");
-
-    if (current_conn && buf->len > 0) {
-        uint8_t notify_data[buf->len + 1];
-        notify_data[0] = 0x05;
-        for (int i = 0; i < buf->len; i++) {
-            notify_data[i + 1] = buf->data[i];
-        }
-        send_notification(notify_data, buf->len + 1);
-    }
-}
-
-static struct bt_le_scan_cb scan_callbacks = {
-    .recv = scan_recv,
-};
-
-static void stop_coded_adv_handler(struct k_work *work)
-{
-    bt_le_ext_adv_stop(coded_adv_set);
-    atomic_set(&is_broadcasting, 0);
-
-    /* Safely restart scanner */
-    int err = bt_le_scan_start(&scan_param, NULL);
-    if (err && err != -EALREADY) {
-        LOG_ERR("Failed to restart Coded PHY scanner (err %d)", err);
-    } else {
-        LOG_INF("Coded PHY Scanner restarted.");
-    }
-}
-
-static void send_notification(uint8_t *data, uint16_t len) {
-    ble_gatt_notify(current_conn, data, len);
-}
-
-static void on_ble_gatt_rx(const uint8_t *data, uint16_t len) {
-    if (len == 0) return;
-    uint8_t res[1];
-
-    switch (data[0]) {
-        case 0x01: // CMD_CONFIG
-            if (len >= 13) {
-                emitter_config.user_id = data[1];
-                emitter_config.damage = data[2];
-                emitter_config.mag_size = sys_get_le16(&data[3]);
-                emitter_config.fire_rate_ms = sys_get_le16(&data[5]);
-                emitter_config.reload_speed_ms = sys_get_le16(&data[7]);
-                emitter_config.full_auto = data[9];
-                emitter_config.ammo_type = data[10];
-                emitter_config.initial_total_ammo = sys_get_le16(&data[11]);
-
-                settings_save_one("emitter/config", &emitter_config, sizeof(emitter_config));
-                current_state = STATE_CONFIGURED;
-                atomic_set(&config_loaded, 1);
-                
-                LOG_INF("Config: Mag:%d, Reload:%dms, Auto:%d, AmmoType:%d, TotalAmmo:%d", 
-                        emitter_config.mag_size, emitter_config.reload_speed_ms, emitter_config.full_auto,
-                        emitter_config.ammo_type, emitter_config.initial_total_ammo);
-                        
-                res[0] = 0x81; send_notification(res, 1); 
-            } else {
-                LOG_WRN("Config payload too short! Need 13 bytes.");
-            }
-            break;
-
-        case 0x02: // CMD_START
-            if (current_state == STATE_CONFIGURED) {
-                current_state = STATE_ACTIVE;
-                is_reloading = false;
-
-                // Divide the starting ammo between the Magazine and the Reserve
-                uint16_t starting_mag = (emitter_config.initial_total_ammo > emitter_config.mag_size) ? 
-                                         emitter_config.mag_size : emitter_config.initial_total_ammo;
-                
-                current_mag_ammo = starting_mag;
-                current_total_ammo = emitter_config.initial_total_ammo - starting_mag;
-
-                LOG_INF("Game Started! Mag: %d, Reserve: %d", current_mag_ammo, current_total_ammo);
-                res[0] = 0x82; send_notification(res, 1);
-            }
-            break;
-
-        case 0x03: // CMD_AMMO_INCREASE (e.g. 0x03 32 00 -> Adds 50 ammo)
-            if (current_state == STATE_ACTIVE && len >= 3) {
-                uint16_t ammo_to_add = sys_get_le16(&data[1]);
-                current_total_ammo += ammo_to_add;
-                LOG_INF("Ammo Pack Received! Added %d. Total Reserve: %d", ammo_to_add, current_total_ammo);
-                res[0] = 0x83; send_notification(res, 1);
-            }
-            break;
-
-        case 0x04: // CMD_GAMEOVER
-            current_state = STATE_CONFIGURED;
-            is_bound = false; 
-            is_reloading = false;
-            k_work_cancel_delayable(&reload_work);
-            k_work_cancel_delayable(&trigger_work);
-            LOG_INF("Game Over. Session Unbound.");
-            res[0] = 0x84; send_notification(res, 1);
-            break;
-
-        case 0x05: // CMD_BROADCAST_CODED_PHY
-            if (len > 1) {
-                uint8_t payload_len = len - 1;
-                struct bt_data ad[] = {
-                    BT_DATA(BT_DATA_MANUFACTURER_DATA, &data[1], payload_len)
-                };
-
-                // Stop scanning before broadcasting to avoid receiving our own message
-                bt_le_scan_stop();
-
-                int err = bt_le_ext_adv_set_data(coded_adv_set, ad, ARRAY_SIZE(ad), NULL, 0);
-                if (err) {
-                    LOG_ERR("Failed to set Coded PHY payload (err %d)", err);
-                }
-
-                struct bt_le_ext_adv_start_param start_param = {
-                    .timeout = 0,
-                    .num_events = 1,
-                };
-                err = bt_le_ext_adv_start(coded_adv_set, &start_param);
-                if (err) {
-                    LOG_ERR("Failed to start Coded PHY adv (err %d)", err);
-                } else {
-                    LOG_INF("Broadcasting %d bytes on Coded PHY. Scanning will resume in 500ms.", payload_len);
-                    atomic_set(&is_broadcasting, 1);
-                    k_work_reschedule(&stop_coded_adv_work, K_MSEC(500));
-                }
-
-                res[0] = 0x85; send_notification(res, 1);
-            } else {
-                LOG_WRN("Broadcast command has no payload.");
-            }
-            break;
-    }
-}
-
-/* ----- Hardware Aliases ----- */
-#define TRIGGER_NODE DT_ALIAS(trigger_button)
+/* ===== Hardware ===== */
+#define TRIGGER_NODE   DT_ALIAS(trigger_button)
 #define PWM_IR_LED_NODE DT_ALIAS(ir_pwm)
 #define STATUS_LED_NODE DT_ALIAS(led0)
 
@@ -227,274 +34,709 @@ static const struct gpio_dt_spec trigger = GPIO_DT_SPEC_GET(TRIGGER_NODE, gpios)
 static const struct gpio_dt_spec status_led = GPIO_DT_SPEC_GET(STATUS_LED_NODE, gpios);
 static const struct device *pwm_dev = DEVICE_DT_GET(PWM_IR_LED_NODE);
 static struct gpio_callback trigger_cb_data;
-
 #define IR_CARRIER_PERIOD_US 26
+
+/* ===== State ===== */
+static enum emitter_state current_state = EMITTER_IDLE;
+static struct bt_conn *phone_conn;
+static struct player_identity local_player;
+static char adv_name[11] = "LT-E-0000";
+
+/* Lobby */
+static uint32_t lobby_code;
+static uint8_t  lobby_game_mode;
+static uint8_t  lobby_host_id;
+
+/* Location */
+static int32_t  current_lat;
+static int32_t  current_lon;
+static uint16_t current_heading;
+
+/* Game config storage */
+static uint8_t  game_config_raw[256];
+static uint16_t game_config_raw_len;
+
+/* Team kill tracking for scoreboard */
+static uint8_t  team_ids[MAX_TEAMS];
+static uint16_t team_kills[MAX_TEAMS];
+static uint8_t  num_teams;
+
+/* Friendly list */
+static uint8_t friendly_ids[MAX_PLAYERS];
+static uint8_t friendly_count;
+
+/* Hit dedup ring buffer */
+static struct hit_dedup_entry hit_dedup[HIT_DEDUP_SIZE];
+static uint8_t hit_dedup_idx;
+
+/* Trigger state */
+static bool trigger_ready = true;
+
+/* ===== Timers / Work Items ===== */
 static struct k_work ir_tx_work;
-static int64_t last_shot_time = 0;
-
-/* ----- Status LED Timer ----- */
+static struct k_work_delayable trigger_work;
+static struct k_work_delayable reload_work;
+static struct k_work_delayable adv_work;
+static struct k_work_delayable lobby_announce_work;
+static struct k_work_delayable player_state_work;
+static struct k_work_delayable scoreboard_work;
 static struct k_timer led_timer;
-static int led_tick = 0;
+static int led_tick;
 
-static void led_timer_handler(struct k_timer *timer_id) {
+/* Config persistence */
+static struct emitter_config saved_config;
+static atomic_t config_loaded = ATOMIC_INIT(0);
+
+/* ===== Forward Declarations ===== */
+static void send_state_update(void);
+static void start_advertising(void);
+
+/* ===== LED Timer ===== */
+static void led_timer_handler(struct k_timer *timer_id)
+{
     led_tick++;
-    if (current_led_state == LED_DISCONNECTED) {
+    if (!phone_conn) {
         gpio_pin_set_dt(&status_led, (led_tick % 10 == 0) ? 1 : 0);
-    } 
-    else if (current_led_state == LED_FLASHING_ID) {
-        if (flash_count_remaining > 0) {
-            gpio_pin_toggle_dt(&status_led);
-            flash_count_remaining--;
-        } else {
-            current_led_state = LED_CONNECTED_SOLID;
-            gpio_pin_set_dt(&status_led, 1);
-        }
     }
 }
 
-/* ----- Shooting & Reloading Logic ----- */
+/* ===== Notifications to Phone ===== */
 
-static void reload_work_handler(struct k_work *work) {
-    // Calculate how much we need to fill the mag
-    uint16_t needed = emitter_config.mag_size - current_mag_ammo;
-    
-    // Take from reserve (take 'needed', unless reserve is smaller than 'needed')
-    uint16_t load_amount = (current_total_ammo >= needed) ? needed : current_total_ammo;
-
-    current_mag_ammo += load_amount;
-    current_total_ammo -= load_amount;
-    
-    is_reloading = false;
-    trigger_ready = false; // Require physical release of trigger before firing again
-    
-    LOG_INF("Reload Complete! Mag: %d, Reserve: %d", current_mag_ammo, current_total_ammo);
-    
-    uint8_t ammo_evt[5];
-    ammo_evt[0] = 0x06; // Ammo update event
-    sys_put_le16(current_mag_ammo, &ammo_evt[1]);
-    sys_put_le16(current_total_ammo, &ammo_evt[3]);
-    send_notification(ammo_evt, sizeof(ammo_evt));
+static void phone_notify(const uint8_t *data, uint16_t len)
+{
+    ble_phone_notify(phone_conn, data, len);
 }
 
-static void ir_tx_work_handler(struct k_work *work) {
-    ir_packet_t pkt = { .user_id = emitter_config.user_id, .damage = emitter_config.damage };
-    ir_handler_tx_send(&pkt);
+static void phone_ack(uint8_t opcode)
+{
+    phone_notify(&opcode, 1);
 }
 
-static void trigger_work_handler(struct k_work *work) {
-    bool is_pressed = (gpio_pin_get_dt(&trigger) == 1);
+static void send_state_update(void)
+{
+    uint8_t buf[6];
+    buf[0] = RSP_STATE_UPDATE;
+    buf[1] = game_state_get_health();
+    sys_put_le16(game_state_get_mag_ammo(), &buf[2]);
+    sys_put_le16(game_state_get_reserve_ammo(), &buf[4]);
+    phone_notify(buf, 6);
+}
 
-    if (!is_pressed) {
-        trigger_ready = true;
-        return; 
-    }
+static void send_death_notify(uint8_t killer_id)
+{
+    uint8_t buf[2] = { RSP_DEATH_NOTIFY, killer_id };
+    phone_notify(buf, 2);
+}
 
-    if (current_state != STATE_ACTIVE) return;
-    if (is_reloading) return; 
+/* ===== Config Parsing ===== */
 
-    // EMPTY MAG / RELOAD LOGIC
-    if (current_mag_ammo == 0) {
-        if (trigger_ready) { // Only attempt reload on a fresh trigger pull
-            if (current_total_ammo > 0) {
-                LOG_INF("Mag Empty! Reloading... (%d ms)", emitter_config.reload_speed_ms);
-                is_reloading = true;
-                trigger_ready = false;
-                k_work_reschedule(&reload_work, K_MSEC(emitter_config.reload_speed_ms));
-            } else {
-                LOG_INF("OUT OF AMMO! Need an ammo pack.");
-                trigger_ready = false; // Prevent spamming the log
-            }
-        }
-        return; 
-    }
+static void parse_emitter_config_from_bytes(const uint8_t *data, struct emitter_config *cfg)
+{
+    cfg->user_id           = data[0];
+    cfg->damage            = data[1];
+    cfg->mag_size          = sys_get_le16(&data[2]);
+    cfg->fire_rate_ms      = sys_get_le16(&data[4]);
+    cfg->reload_speed_ms   = sys_get_le16(&data[6]);
+    cfg->full_auto         = data[8];
+    cfg->ammo_type         = data[9];
+    cfg->initial_total_ammo = sys_get_le16(&data[10]);
+    cfg->max_health        = data[12];
+    cfg->friendly_fire     = data[13];
+}
 
-    // SEMI-AUTO CHECK
-    if (!emitter_config.full_auto && !trigger_ready) {
-        return; 
-    }
-
-    // FIRE RATE CHECK
-    int64_t now = k_uptime_get();
-    int64_t elapsed = now - last_shot_time;
-    if (elapsed < emitter_config.fire_rate_ms) {
-        int64_t wait_time = emitter_config.fire_rate_ms - elapsed;
-        k_work_reschedule(&trigger_work, K_MSEC(wait_time));
+static void apply_game_config(const uint8_t *data, uint16_t len)
+{
+    if (len < 10) {
         return;
     }
 
-    // FIRE!
-    last_shot_time = now;
-    current_mag_ammo--;
-    trigger_ready = false;
-    LOG_INF("FIRE! Mag: %d, Reserve: %d", current_mag_ammo, current_total_ammo);
-    
-    uint8_t ammo_evt[5];
-    ammo_evt[0] = 0x06; // Ammo update event
-    sys_put_le16(current_mag_ammo, &ammo_evt[1]);
-    sys_put_le16(current_total_ammo, &ammo_evt[3]);
-    send_notification(ammo_evt, sizeof(ammo_evt));
+    uint16_t pos = 0;
+    /* uint8_t game_mode = data[pos]; */ pos += 1;
+    /* uint16_t time_limit = sys_get_le16(&data[pos]); */ pos += 2;
+    /* uint16_t score_limit = sys_get_le16(&data[pos]); */ pos += 2;
+    /* uint16_t loc_interval = sys_get_le16(&data[pos]); */ pos += 2;
+    /* uint16_t respawn_time = sys_get_le16(&data[pos]); */ pos += 2;
+    uint8_t n_teams   = data[pos++];
+    uint8_t n_players = data[pos++];
 
-    k_work_submit(&ir_tx_work);
+    num_teams = (n_teams > MAX_TEAMS) ? MAX_TEAMS : n_teams;
+    for (int i = 0; i < n_teams && pos < len; i++) {
+        if (i < MAX_TEAMS) {
+            team_ids[i] = data[pos];
+            team_kills[i] = 0;
+        }
+        pos++;
+        uint8_t name_len = data[pos++];
+        pos += name_len;
+    }
 
-    // AUTO-FIRE LOOP
-    if (emitter_config.full_auto && current_mag_ammo > 0) {
-        k_work_reschedule(&trigger_work, K_MSEC(emitter_config.fire_rate_ms));
+    /* Build friendly list: players on same team */
+    friendly_count = 0;
+    uint16_t player_section = pos;
+    for (int i = 0; i < n_players && player_section < len; i++) {
+        uint8_t pid = data[player_section++];
+        uint8_t tid = data[player_section++];
+        uint8_t ulen = data[player_section++];
+        player_section += ulen;
+
+        if (tid == local_player.team_id && pid != local_player.player_id) {
+            if (friendly_count < MAX_PLAYERS) {
+                friendly_ids[friendly_count++] = pid;
+            }
+        }
+    }
+    pos = player_section;
+
+    /* Emitter config (14 bytes) */
+    if (pos + EMITTER_CONFIG_SIZE <= len) {
+        struct emitter_config cfg;
+        parse_emitter_config_from_bytes(&data[pos], &cfg);
+        cfg.user_id = local_player.player_id;
+        game_state_set_config(&cfg);
     }
 }
 
-void trigger_pressed_cb(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+/* ===== Vest Hit Callback ===== */
+
+static bool hit_dedup_check(uint16_t packet_id)
+{
+    for (int i = 0; i < HIT_DEDUP_SIZE; i++) {
+        if (hit_dedup[i].used && hit_dedup[i].packet_id == packet_id) {
+            return true;
+        }
+    }
+    hit_dedup[hit_dedup_idx].packet_id = packet_id;
+    hit_dedup[hit_dedup_idx].used = true;
+    hit_dedup_idx = (hit_dedup_idx + 1) % HIT_DEDUP_SIZE;
+    return false;
+}
+
+static void on_vest_hit(uint16_t packet_id, uint8_t shooter_id,
+                        uint8_t weapon_id, uint8_t team_id)
+{
+    if (current_state != EMITTER_GAME_ACTIVE && current_state != EMITTER_DEAD) {
+        return;
+    }
+
+    ble_vest_send_hit_ack(packet_id);
+
+    if (hit_dedup_check(packet_id)) {
+        return;
+    }
+
+    if (current_state != EMITTER_GAME_ACTIVE) {
+        return;
+    }
+
+    const struct emitter_config *cfg = game_state_get_config();
+    uint8_t damage = cfg->damage;
+
+    bool died = game_state_apply_hit(damage);
+    send_state_update();
+
+    mesh_broadcast_hit_event(shooter_id, local_player.player_id,
+                             damage, game_state_get_health(), 0);
+
+    if (died) {
+        current_state = EMITTER_DEAD;
+        ble_vest_send_death();
+        send_death_notify(shooter_id);
+        mesh_broadcast_player_death(local_player.player_id, shooter_id,
+                                    game_state_get_kills(),
+                                    game_state_get_deaths(), 3);
+        k_work_cancel_delayable(&player_state_work);
+        k_work_cancel_delayable(&scoreboard_work);
+    }
+}
+
+static void on_vest_connected(const uint8_t *mac)
+{
+    uint8_t buf[7];
+    buf[0] = RSP_VEST_PAIRED;
+    memcpy(&buf[1], mac, 6);
+    phone_notify(buf, 7);
+    LOG_INF("Vest paired, notified phone");
+}
+
+static void on_vest_disconnected(void)
+{
+    LOG_WRN("Vest disconnected");
+}
+
+/* ===== IR TX Work ===== */
+
+static void ir_tx_work_handler(struct k_work *work)
+{
+    const struct emitter_config *cfg = game_state_get_config();
+    ir_packet_t pkt = {
+        .player_id = local_player.player_id,
+        .weapon_id = 0x00,
+        .team_id   = local_player.team_id,
+    };
+    ir_tx_send(&pkt);
+}
+
+/* ===== Trigger Handling ===== */
+
+static void trigger_work_handler(struct k_work *work)
+{
+    bool pressed = (gpio_pin_get_dt(&trigger) == 1);
+
+    if (!pressed) {
+        trigger_ready = true;
+        return;
+    }
+
+    if (current_state == EMITTER_PAIRING) {
+        bt_addr_le_t addrs[1];
+        size_t count = 1;
+        bt_id_get(addrs, &count);
+        ble_vest_start_pairing_broadcast(addrs[0].a.val, local_player.player_id);
+        trigger_ready = false;
+        return;
+    }
+
+    if (current_state != EMITTER_GAME_ACTIVE) {
+        return;
+    }
+
+    if (game_state_is_reloading()) {
+        return;
+    }
+
+    if (game_state_get_mag_ammo() == 0) {
+        return;
+    }
+
+    const struct emitter_config *cfg = game_state_get_config();
+    if (!cfg->full_auto && !trigger_ready) {
+        return;
+    }
+
+    int64_t now = k_uptime_get();
+    if (!game_state_try_fire(now)) {
+        k_work_reschedule(&trigger_work, K_MSEC(cfg->fire_rate_ms));
+        return;
+    }
+
+    trigger_ready = false;
+    send_state_update();
+    k_work_submit(&ir_tx_work);
+
+    if (cfg->full_auto && game_state_get_mag_ammo() > 0) {
+        k_work_reschedule(&trigger_work, K_MSEC(cfg->fire_rate_ms));
+    }
+}
+
+static void trigger_pressed_cb(const struct device *dev, struct gpio_callback *cb,
+                                uint32_t pins)
+{
     k_work_reschedule(&trigger_work, K_NO_WAIT);
 }
 
-/* ----- Bluetooth ----- */
-static void start_advertising(void) {
+/* ===== Reload ===== */
+
+static void reload_work_handler(struct k_work *work)
+{
+    game_state_complete_reload();
+    send_state_update();
+}
+
+/* ===== Periodic Broadcasts ===== */
+
+static void lobby_announce_handler(struct k_work *work)
+{
+    if (current_state != EMITTER_LOBBY_HOST) {
+        return;
+    }
+    mesh_broadcast_lobby_announce(lobby_code, lobby_game_mode,
+                                  local_player.username, 1);
+    k_work_reschedule(&lobby_announce_work, K_MSEC(500));
+}
+
+static void player_state_handler(struct k_work *work)
+{
+    if (current_state != EMITTER_GAME_ACTIVE) {
+        return;
+    }
+
+    const struct emitter_config *cfg = game_state_get_config();
+    uint16_t mag = game_state_get_mag_ammo();
+    uint16_t res = game_state_get_reserve_ammo();
+    uint16_t total_max = cfg->initial_total_ammo;
+    uint8_t ammo_pct = total_max > 0 ? (uint8_t)((((uint32_t)mag + res) * 100) / total_max) : 0;
+
+    mesh_broadcast_player_state(local_player.player_id, local_player.team_id,
+                                current_lat, current_lon,
+                                game_state_get_health(), ammo_pct,
+                                game_state_is_alive() ? 1 : 0,
+                                game_state_get_kills(),
+                                game_state_get_deaths());
+
+    k_work_reschedule(&player_state_work, K_MSEC(3000));
+}
+
+static void scoreboard_handler(struct k_work *work)
+{
+    if (current_state != EMITTER_GAME_ACTIVE && current_state != EMITTER_DEAD) {
+        return;
+    }
+    mesh_broadcast_scoreboard(num_teams, team_ids, team_kills);
+    k_work_reschedule(&scoreboard_work, K_MSEC(10000));
+}
+
+/* ===== Phone Command Handler ===== */
+
+static void on_phone_rx(const uint8_t *data, uint16_t len)
+{
+    if (len == 0) {
+        return;
+    }
+
+    switch (data[0]) {
+
+    case CMD_CONFIG:
+        if (len >= 1 + EMITTER_CONFIG_SIZE) {
+            struct emitter_config cfg;
+            parse_emitter_config_from_bytes(&data[1], &cfg);
+            game_state_set_config(&cfg);
+            settings_save_one("emitter/config", &cfg, sizeof(cfg));
+            phone_ack(RSP_CONFIG_ACK);
+        }
+        break;
+
+    case CMD_START:
+        game_state_start_game();
+        current_state = EMITTER_GAME_ACTIVE;
+
+        if (ble_vest_is_connected()) {
+            ble_vest_send_friendly_list(friendly_ids, friendly_count);
+            const struct emitter_config *cfg = game_state_get_config();
+            ble_vest_send_friendly_fire(cfg->friendly_fire);
+        }
+
+        phone_ack(RSP_START_ACK);
+        send_state_update();
+        k_work_reschedule(&player_state_work, K_MSEC(3000));
+        k_work_reschedule(&scoreboard_work, K_MSEC(10000));
+        break;
+
+    case CMD_AMMO_INCREASE:
+        if (current_state == EMITTER_GAME_ACTIVE && len >= 3) {
+            uint16_t amount = sys_get_le16(&data[1]);
+            game_state_add_ammo(amount);
+            phone_ack(RSP_AMMO_ACK);
+            send_state_update();
+        }
+        break;
+
+    case CMD_GAME_OVER:
+        current_state = EMITTER_GAME_OVER;
+        k_work_cancel_delayable(&player_state_work);
+        k_work_cancel_delayable(&scoreboard_work);
+        k_work_cancel_delayable(&reload_work);
+        k_work_cancel_delayable(&trigger_work);
+        phone_ack(RSP_GAME_OVER_ACK);
+        current_state = EMITTER_IDLE;
+        break;
+
+    case CMD_BROADCAST_CODED_PHY:
+        if (len > 1) {
+            mesh_broadcast_raw(&data[1], len - 1);
+            phone_ack(RSP_BROADCAST_ACK);
+        }
+        break;
+
+    case CMD_SET_PLAYER_INFO:
+        if (len >= 3) {
+            local_player.player_id = data[1];
+            local_player.team_id = data[2];
+            uint8_t name_len = len - 3;
+            if (name_len > MAX_USERNAME_LEN) name_len = MAX_USERNAME_LEN;
+            memcpy(local_player.username, &data[3], name_len);
+            local_player.username[name_len] = '\0';
+            mesh_set_identity(local_player.player_id, local_player.team_id);
+            LOG_INF("Player: id=%d team=%d name=%s",
+                    local_player.player_id, local_player.team_id, local_player.username);
+            phone_ack(RSP_PLAYER_INFO_ACK);
+        }
+        break;
+
+    case CMD_START_LOBBY_HOST:
+        if (len >= 7) {
+            lobby_code = sys_get_le32(&data[1]);
+            lobby_game_mode = data[5];
+            lobby_host_id = data[6];
+            current_state = EMITTER_LOBBY_HOST;
+            k_work_reschedule(&lobby_announce_work, K_NO_WAIT);
+            phone_ack(RSP_LOBBY_HOST_ACK);
+        }
+        break;
+
+    case CMD_START_LOBBY_SCAN:
+        current_state = EMITTER_LOBBY_SCAN;
+        phone_ack(RSP_LOBBY_SCAN_ACK);
+        break;
+
+    case CMD_STOP_LOBBY:
+        k_work_cancel_delayable(&lobby_announce_work);
+        current_state = EMITTER_IDLE;
+        break;
+
+    case CMD_BROADCAST_GAME_CFG:
+        if (len > 1) {
+            game_config_raw_len = len - 1;
+            memcpy(game_config_raw, &data[1], game_config_raw_len);
+
+            apply_game_config(game_config_raw, game_config_raw_len);
+            game_state_start_game();
+            current_state = EMITTER_GAME_ACTIVE;
+
+            mesh_broadcast_game_start(game_config_raw, game_config_raw_len, 5);
+
+            if (ble_vest_is_connected()) {
+                ble_vest_send_friendly_list(friendly_ids, friendly_count);
+                const struct emitter_config *cfg = game_state_get_config();
+                ble_vest_send_friendly_fire(cfg->friendly_fire);
+            }
+
+            phone_ack(RSP_GAME_CFG_ACK);
+            send_state_update();
+            k_work_reschedule(&player_state_work, K_MSEC(3000));
+            k_work_reschedule(&scoreboard_work, K_MSEC(10000));
+        }
+        break;
+
+    case CMD_UPDATE_LOCATION:
+        if (len >= 11) {
+            current_lat = (int32_t)sys_get_le32(&data[1]);
+            current_lon = (int32_t)sys_get_le32(&data[5]);
+            current_heading = sys_get_le16(&data[9]);
+            phone_ack(RSP_LOCATION_ACK);
+        }
+        break;
+
+    case CMD_REQUEST_MESH_STATS:
+        phone_ack(RSP_MESH_STATS_ACK);
+        break;
+
+    case CMD_ENTER_PAIRING:
+        current_state = EMITTER_PAIRING;
+        phone_ack(RSP_PAIRING_ACK);
+        LOG_INF("Pairing mode: pull trigger near vest");
+        break;
+
+    case CMD_UNPAIR_VEST:
+        ble_vest_disconnect();
+        break;
+
+    case CMD_RESPAWN:
+        if (current_state == EMITTER_DEAD) {
+            game_state_respawn();
+            current_state = EMITTER_GAME_ACTIVE;
+
+            if (ble_vest_is_connected()) {
+                ble_vest_send_respawn();
+            }
+
+            mesh_broadcast_player_respawn(local_player.player_id, 3);
+            phone_ack(RSP_RESPAWN_ACK);
+            send_state_update();
+            k_work_reschedule(&player_state_work, K_MSEC(3000));
+            k_work_reschedule(&scoreboard_work, K_MSEC(10000));
+        }
+        break;
+
+    case CMD_RELOAD:
+        if (current_state == EMITTER_GAME_ACTIVE) {
+            const struct emitter_config *cfg = game_state_get_config();
+            if (game_state_start_reload()) {
+                k_work_reschedule(&reload_work, K_MSEC(cfg->reload_speed_ms));
+            }
+        }
+        break;
+    }
+}
+
+/* ===== Coded PHY Scan Callback ===== */
+
+static void scan_recv(const struct bt_le_scan_recv_info *info, struct net_buf_simple *buf)
+{
+    if (buf->len == 0) {
+        return;
+    }
+
+    /* Vest discovery on 1M PHY (during pairing or reconnection) */
+    if (current_state == EMITTER_PAIRING || !ble_vest_is_connected()) {
+        ble_vest_on_scan_result(info->addr, info->rssi, buf);
+    }
+
+    /* Mesh messages */
+    if (phone_conn) {
+        mesh_process_received(buf->data, buf->len, info->rssi);
+    }
+}
+
+static struct bt_le_scan_cb scan_callbacks = {
+    .recv = scan_recv,
+};
+
+/* ===== BLE Connection Callbacks ===== */
+
+static void adv_work_handler(struct k_work *work)
+{
+    start_advertising();
+}
+
+static void start_advertising(void)
+{
     struct bt_data ad[] = {
         BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
         BT_DATA(BT_DATA_NAME_COMPLETE, adv_name, strlen(adv_name)),
     };
-    struct bt_le_adv_param param = BT_LE_ADV_PARAM_INIT(BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_SCANNABLE,
+    struct bt_le_adv_param param = BT_LE_ADV_PARAM_INIT(
+        BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_SCANNABLE,
         BT_GAP_ADV_FAST_INT_MIN_2, BT_GAP_ADV_FAST_INT_MAX_2, NULL);
-    
+
     int err = bt_le_adv_start(&param, ad, ARRAY_SIZE(ad), NULL, 0);
-    if (err) {
-        if (err == -EALREADY) {
-            LOG_WRN("Advertising is already running.");
-        } else {
-            LOG_ERR("Advertising failed to start (err %d)", err);
-        }
-    } else {
-        LOG_INF("Advertising successfully re-started.");
+    if (err && err != -EALREADY) {
+        LOG_ERR("Adv start failed (err %d)", err);
     }
 }
 
-static void adv_work_handler(struct k_work *work) {
-    start_advertising();
-}
-
-static void connected(struct bt_conn *conn, uint8_t err) {
+static void connected(struct bt_conn *conn, uint8_t err)
+{
     if (err) {
         LOG_ERR("Connection failed (err 0x%02x)", err);
         return;
     }
-    
-    const bt_addr_le_t *peer_addr = bt_conn_get_dst(conn);
-    char addr_str[BT_ADDR_LE_STR_LEN];
-    bt_addr_le_to_str(peer_addr, addr_str, sizeof(addr_str));
 
-    LOG_INF("Connection attempt from: %s", addr_str);
+    struct bt_conn_info info;
+    bt_conn_get_info(conn, &info);
 
-    if (is_bound) {
-        if (bt_addr_le_cmp(peer_addr, &bound_peer_addr) != 0) {
-            LOG_WRN("REJECTED: Phone MAC doesn't match bound session!");
-            bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
-            return;
-        }
-    } else {
-        bound_peer_addr = *peer_addr;
-        is_bound = true;
-        connection_id_blinks = (bound_peer_addr.a.val[0] % 5) + 1;
-        LOG_INF("Session Bound to this phone.");
-    }
-
-    current_led_state = LED_FLASHING_ID;
-    flash_count_remaining = connection_id_blinks * 2; 
-    led_tick = 0; 
-    current_conn = bt_conn_ref(conn);
-}
-
-static void disconnected(struct bt_conn *conn, uint8_t reason) {
-    current_led_state = LED_DISCONNECTED;
-    if (current_conn) { 
-        bt_conn_unref(current_conn); 
-        current_conn = NULL; 
-    }
-    
-    LOG_INF("Disconnected. Restarting advertising in 100ms...");
-    
-    // --- CHANGED: Give the Bluetooth stack 100ms to clean up its memory! ---
-    k_work_reschedule(&adv_work, K_MSEC(100)); 
-}
-
-BT_CONN_CB_DEFINE(conn_callbacks) = { .connected = connected, .disconnected = disconnected };
-
-static void bt_ready(int err) {
-    if (err) {
-        LOG_ERR("Bluetooth initialization failed (err %d)", err);
+    /* Only handle incoming connections (phone → emitter peripheral) */
+    if (info.role != BT_CONN_ROLE_PERIPHERAL) {
         return;
     }
 
+    const bt_addr_le_t *addr = bt_conn_get_dst(conn);
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+    LOG_INF("Phone connected: %s", addr_str);
+
+    phone_conn = bt_conn_ref(conn);
+    mesh_set_phone_conn(phone_conn);
+    gpio_pin_set_dt(&status_led, 1);
+}
+
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
+    if (conn == phone_conn) {
+        LOG_INF("Phone disconnected (reason %d)", reason);
+        bt_conn_unref(phone_conn);
+        phone_conn = NULL;
+        mesh_set_phone_conn(NULL);
+        gpio_pin_set_dt(&status_led, 0);
+        k_work_reschedule(&adv_work, K_MSEC(100));
+    }
+}
+
+BT_CONN_CB_DEFINE(phone_conn_cbs) = {
+    .connected = connected,
+    .disconnected = disconnected,
+};
+
+/* ===== BT Ready ===== */
+
+static void bt_ready(int err)
+{
+    if (err) {
+        LOG_ERR("BT init failed (err %d)", err);
+        return;
+    }
+
+    /* Set device name: LT-E-XXXX */
     bt_addr_le_t addrs[1];
     size_t count = 1;
     bt_id_get(addrs, &count);
     if (count > 0) {
-        sprintf(&adv_name[7], "%02X%02X%02X", addrs[0].a.val[2], addrs[0].a.val[1], addrs[0].a.val[0]);
+        snprintf(adv_name, sizeof(adv_name), "LT-E-%02X%02X",
+                 addrs[0].a.val[1], addrs[0].a.val[0]);
     }
+    bt_set_name(adv_name);
+    LOG_INF("Device name: %s", adv_name);
+
     start_advertising();
 
-    /* --- Coded PHY Ext Advertising & Scanner Setup --- */
-    struct bt_le_adv_param adv_param = {
-        .id = BT_ID_DEFAULT,
-        .sid = 1, // Must be 1 to not conflict with legacy ad (which defaults to 0)
-        .secondary_max_skip = 0,
-        .options = BT_LE_ADV_OPT_EXT_ADV | BT_LE_ADV_OPT_CODED,
-        .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
-        .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
-        .peer = NULL,
-    };
-
-    err = bt_le_ext_adv_create(&adv_param, NULL, &coded_adv_set);
-    if (err) {
-        LOG_ERR("Failed to create Coded PHY Adv set (err %d)", err);
-    }
-
+    /* Coded PHY mesh setup */
+    mesh_create_coded_adv_set();
     bt_le_scan_cb_register(&scan_callbacks);
-    err = bt_le_scan_start(&scan_param, NULL);
-    if (err) {
-        LOG_ERR("Failed to start Coded PHY scanner (err %d)", err);
-    } else {
-        LOG_INF("Coded PHY scanner started successfully.");
-    }
+    mesh_start_scanner();
 }
 
-/* ----- Settings ----- */
-static int settings_set(const char *name, size_t len, settings_read_cb read_cb, void *cb_arg) {
-    if (strcmp(name, "config") == 0) {
-        if (len == sizeof(emitter_config)) {
-            read_cb(cb_arg, &emitter_config, sizeof(emitter_config));
-            atomic_set(&config_loaded, 1);
-            current_state = STATE_CONFIGURED;
-            LOG_INF("Loaded config from memory.");
-        }
+/* ===== Settings (NVS persistence) ===== */
+
+static int settings_set(const char *name, size_t len,
+                        settings_read_cb read_cb, void *cb_arg)
+{
+    if (strcmp(name, "config") == 0 && len == sizeof(saved_config)) {
+        read_cb(cb_arg, &saved_config, sizeof(saved_config));
+        game_state_set_config(&saved_config);
+        atomic_set(&config_loaded, 1);
         return 0;
     }
     return -ENOENT;
 }
-struct settings_handler h = { .name = "emitter", .h_set = settings_set };
 
-int main(void) {
+static struct settings_handler settings_h = {
+    .name = "emitter",
+    .h_set = settings_set,
+};
+
+/* ===== Main ===== */
+
+int main(void)
+{
+    /* GPIO setup */
     gpio_pin_configure_dt(&trigger, GPIO_INPUT);
     gpio_pin_interrupt_configure_dt(&trigger, GPIO_INT_EDGE_BOTH);
     gpio_init_callback(&trigger_cb_data, trigger_pressed_cb, BIT(trigger.pin));
     gpio_add_callback(trigger.port, &trigger_cb_data);
-
     gpio_pin_configure_dt(&status_led, GPIO_OUTPUT_INACTIVE);
 
+    /* Work items */
+    k_work_init(&ir_tx_work, ir_tx_work_handler);
     k_work_init_delayable(&trigger_work, trigger_work_handler);
     k_work_init_delayable(&reload_work, reload_work_handler);
     k_work_init_delayable(&adv_work, adv_work_handler);
-    k_work_init_delayable(&stop_coded_adv_work, stop_coded_adv_handler);
-    k_work_init(&ir_tx_work, ir_tx_work_handler);
+    k_work_init_delayable(&lobby_announce_work, lobby_announce_handler);
+    k_work_init_delayable(&player_state_work, player_state_handler);
+    k_work_init_delayable(&scoreboard_work, scoreboard_handler);
 
+    /* LED timer */
     k_timer_init(&led_timer, led_timer_handler, NULL);
     k_timer_start(&led_timer, K_MSEC(100), K_MSEC(100));
 
-    ir_handler_tx_init(pwm_dev, IR_CARRIER_PERIOD_US);
+    /* IR transmitter */
+    ir_tx_init(pwm_dev, IR_CARRIER_PERIOD_US);
 
+    /* Game state */
+    game_state_init();
+
+    /* Mesh */
+    mesh_init();
+
+    /* Vest BLE central */
+    ble_vest_init(on_vest_hit, on_vest_connected, on_vest_disconnected);
+
+    /* Settings */
     settings_subsys_init();
-    settings_register(&h);
+    settings_register(&settings_h);
     settings_load();
-    
-    ble_gatt_init(on_ble_gatt_rx);
+
+    /* Phone BLE peripheral */
+    ble_phone_init(on_phone_rx);
     bt_enable(bt_ready);
+
     return 0;
 }

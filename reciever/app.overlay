@@ -1,6 +1,7 @@
 / {
     aliases {
         irsensor = &ir_rx_pin;
+        unpair-button = &unpair_button;
     };
 
     gpio_inputs {
@@ -8,6 +9,10 @@
         ir_rx_pin: ir_rx_pin {
             gpios = <&gpio0 8 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
             label = "VS1838B IR Receiver";
+        };
+        unpair_button: unpair_button {
+            gpios = <&gpio0 13 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+            label = "Unpair Button";
         };
     };
 };
