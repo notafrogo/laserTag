@@ -3,6 +3,7 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/random/random.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/byteorder.h>
 
@@ -242,7 +243,7 @@ static void pairing_scan_recv(const struct bt_le_scan_recv_info *info,
     uint16_t pos = 0;
     while (pos + 1 < buf->len) {
         uint8_t ad_len = d[pos];
-        if (ad_len == 0 || pos + ad_len >= buf->len) {
+        if (ad_len == 0 || pos + 1 + ad_len > buf->len) {
             break;
         }
         uint8_t ad_type = d[pos + 1];
@@ -251,9 +252,12 @@ static void pairing_scan_recv(const struct bt_le_scan_recv_info *info,
             if (mfg[0] == PAIRING_FLAG) {
                 LOG_INF("Pairing broadcast received! RSSI=%d", info->rssi);
 
-                /* Store emitter MAC in NVS */
-                paired_emitter_addr.type = BT_ADDR_LE_PUBLIC;
-                memcpy(paired_emitter_addr.a.val, &mfg[1], 6);
+                /* Store the actual source address (with correct type) so
+                 * subsequent directed advertising can target it. The MAC in
+                 * the manufacturer payload is informational only; the BLE
+                 * source address has the correct PUBLIC/RANDOM type tag.
+                 */
+                bt_addr_le_copy(&paired_emitter_addr, info->addr);
                 has_paired_addr = true;
 
                 settings_save_one("vest/emitter_addr",
@@ -345,6 +349,9 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 
 static void start_advertising(void)
 {
+    /* Idempotent: stop any prior adv so we can switch modes cleanly. */
+    bt_le_adv_stop();
+
     struct bt_data ad[] = {
         BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
         BT_DATA(BT_DATA_NAME_COMPLETE, adv_name, strlen(adv_name)),
@@ -363,20 +370,31 @@ static void start_advertising(void)
 
 static void start_directed_advertising(void)
 {
-    struct bt_data ad[] = {
-        BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-        BT_DATA(BT_DATA_NAME_COMPLETE, adv_name, strlen(adv_name)),
-    };
-    struct bt_le_adv_param param = BT_LE_ADV_PARAM_INIT(
-        BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_SCANNABLE,
-        BT_GAP_ADV_FAST_INT_MIN_2, BT_GAP_ADV_FAST_INT_MAX_2, NULL);
-
-    int err = bt_le_adv_start(&param, ad, ARRAY_SIZE(ad), NULL, 0);
-    if (err && err != -EALREADY) {
-        LOG_ERR("Directed adv start failed (err %d)", err);
-    } else {
-        LOG_INF("Directed advertising started (waiting for emitter)");
+    if (!has_paired_addr) {
+        start_advertising();
+        return;
     }
+
+    /* Idempotent: stop any prior adv so we can switch modes cleanly. */
+    bt_le_adv_stop();
+
+    /* Low-duty directed adv: only the paired emitter can establish a
+     * connection from this advertisement. Legacy directed adv carries no
+     * payload, so the device name is unavailable here — but the peer
+     * already knows our address from pairing.
+     */
+    struct bt_le_adv_param param = BT_LE_ADV_PARAM_INIT(
+        BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_DIR_MODE_LOW_DUTY,
+        BT_GAP_ADV_FAST_INT_MIN_2, BT_GAP_ADV_FAST_INT_MAX_2,
+        &paired_emitter_addr);
+
+    int err = bt_le_adv_start(&param, NULL, 0, NULL, 0);
+    if (err) {
+        LOG_ERR("Directed adv start failed (err %d), falling back to general", err);
+        start_advertising();
+        return;
+    }
+    LOG_INF("Directed advertising started toward paired emitter");
 }
 
 /* ===== BT Ready ===== */

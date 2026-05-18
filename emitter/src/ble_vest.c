@@ -159,9 +159,19 @@ static uint8_t gatt_discover_cb(struct bt_conn *conn,
 
 static void vest_conn_connected(struct bt_conn *conn, uint8_t err)
 {
+    /* Bail early if this isn't our pending vest connection — the connected
+     * callback also fires for phone connections, and an err here for the
+     * phone must not wipe out a separately-tracked vest connection.
+     */
+    if (conn != vest_conn) {
+        return;
+    }
+
     if (err) {
         LOG_ERR("Vest connection failed (err %d)", err);
+        bt_conn_unref(vest_conn);
         vest_conn = NULL;
+        mesh_start_scanner();
         return;
     }
 
@@ -170,24 +180,21 @@ static void vest_conn_connected(struct bt_conn *conn, uint8_t err)
         return;
     }
 
-    /* Only process if this is the vest connection (not phone) */
-    if (vest_conn && vest_conn == conn) {
-        char addr_str[BT_ADDR_LE_STR_LEN];
-        bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
-        LOG_INF("Vest connected: %s", addr_str);
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+    LOG_INF("Vest connected: %s", addr_str);
 
-        memcpy(vest_mac, addr->a.val, 6);
-        has_vest_mac = true;
+    memcpy(vest_mac, addr->a.val, 6);
+    has_vest_mac = true;
 
-        cmd_rx_handle = 0;
-        hit_tx_value_handle = 0;
-        start_gatt_discovery(conn);
+    cmd_rx_handle = 0;
+    hit_tx_value_handle = 0;
+    start_gatt_discovery(conn);
 
-        mesh_start_scanner();
+    mesh_start_scanner();
 
-        if (connected_cb) {
-            connected_cb(vest_mac);
-        }
+    if (connected_cb) {
+        connected_cb(vest_mac);
     }
 }
 

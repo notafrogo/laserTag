@@ -83,6 +83,20 @@ static struct k_work_delayable scoreboard_work;
 static struct k_timer led_timer;
 static int led_tick;
 
+/* Dedicated workqueue for IR TX: ir_tx_send blocks for ~30 ms per shot via
+ * k_msleep loops. Running it on the system workqueue stalls every other
+ * delayed work (trigger, reload, adv, mesh) for the duration of the burst.
+ * Cooperative priority (-1, same as default system workqueue) so kernel
+ * preemption doesn't jitter the IR pulse timing — the RX state machine
+ * expects 500-2500us marks/spaces and a 10ms preemption tick would corrupt
+ * the bit stream. With its own thread, the system workqueue still drains
+ * during the k_msleep gaps.
+ */
+#define IR_TX_STACK_SIZE 1024
+#define IR_TX_PRIORITY   (-1)
+K_THREAD_STACK_DEFINE(ir_tx_stack, IR_TX_STACK_SIZE);
+static struct k_work_q ir_tx_q;
+
 /* Config persistence */
 static struct emitter_config saved_config;
 static atomic_t config_loaded = ATOMIC_INIT(0);
@@ -160,23 +174,35 @@ static void apply_game_config(const uint8_t *data, uint16_t len)
     uint8_t n_players = data[pos++];
 
     num_teams = (n_teams > MAX_TEAMS) ? MAX_TEAMS : n_teams;
-    for (int i = 0; i < n_teams && pos < len; i++) {
+    for (int i = 0; i < n_teams; i++) {
+        if (pos + 2 > len) {
+            return;
+        }
         if (i < MAX_TEAMS) {
             team_ids[i] = data[pos];
             team_kills[i] = 0;
         }
         pos++;
         uint8_t name_len = data[pos++];
+        if (pos + name_len > len) {
+            return;
+        }
         pos += name_len;
     }
 
     /* Build friendly list: players on same team */
     friendly_count = 0;
     uint16_t player_section = pos;
-    for (int i = 0; i < n_players && player_section < len; i++) {
+    for (int i = 0; i < n_players; i++) {
+        if (player_section + 3 > len) {
+            return;
+        }
         uint8_t pid = data[player_section++];
         uint8_t tid = data[player_section++];
         uint8_t ulen = data[player_section++];
+        if (player_section + ulen > len) {
+            return;
+        }
         player_section += ulen;
 
         if (tid == local_player.team_id && pid != local_player.player_id) {
@@ -321,7 +347,7 @@ static void trigger_work_handler(struct k_work *work)
 
     trigger_ready = false;
     send_state_update();
-    k_work_submit(&ir_tx_work);
+    k_work_submit_to_queue(&ir_tx_q, &ir_tx_work);
 
     if (cfg->full_auto && game_state_get_mag_ammo() > 0) {
         k_work_reschedule(&trigger_work, K_MSEC(cfg->fire_rate_ms));
@@ -431,13 +457,12 @@ static void on_phone_rx(const uint8_t *data, uint16_t len)
         break;
 
     case CMD_GAME_OVER:
-        current_state = EMITTER_GAME_OVER;
         k_work_cancel_delayable(&player_state_work);
         k_work_cancel_delayable(&scoreboard_work);
         k_work_cancel_delayable(&reload_work);
         k_work_cancel_delayable(&trigger_work);
-        phone_ack(RSP_GAME_OVER_ACK);
         current_state = EMITTER_IDLE;
+        phone_ack(RSP_GAME_OVER_ACK);
         break;
 
     case CMD_BROADCAST_CODED_PHY:
@@ -703,6 +728,11 @@ int main(void)
     gpio_init_callback(&trigger_cb_data, trigger_pressed_cb, BIT(trigger.pin));
     gpio_add_callback(trigger.port, &trigger_cb_data);
     gpio_pin_configure_dt(&status_led, GPIO_OUTPUT_INACTIVE);
+
+    /* Dedicated IR TX workqueue (ir_tx_send blocks ~30 ms per shot) */
+    k_work_queue_init(&ir_tx_q);
+    k_work_queue_start(&ir_tx_q, ir_tx_stack, K_THREAD_STACK_SIZEOF(ir_tx_stack),
+                       IR_TX_PRIORITY, NULL);
 
     /* Work items */
     k_work_init(&ir_tx_work, ir_tx_work_handler);

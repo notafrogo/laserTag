@@ -1,6 +1,7 @@
 #include "mesh.h"
 #include "ble_phone.h"
 #include <zephyr/kernel.h>
+#include <zephyr/random/random.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/logging/log.h>
 #include <stdlib.h>
@@ -17,7 +18,24 @@ static uint16_t seq_counter;
 /* ===== Coded PHY Advertising Set ===== */
 static struct bt_le_ext_adv *coded_adv_set;
 static struct k_work_delayable stop_adv_work;
+static struct k_work tx_pump_work;
 static atomic_t is_broadcasting = ATOMIC_INIT(0);
+
+/* ===== TX Queue (multi-context callers serialized into one BLE op stream) =====
+ * Callers come from system workqueue (periodic timers), BT host thread
+ * (on_vest_hit -> mesh_broadcast_hit_event), and the GATT write handler.
+ * Without queueing, overlapping broadcasts fail with -EBUSY and are lost.
+ */
+#define MESH_TX_QUEUE_SIZE 4
+struct mesh_tx_slot {
+    uint8_t  buf[256];
+    uint16_t len;
+};
+static struct mesh_tx_slot tx_queue[MESH_TX_QUEUE_SIZE];
+static uint8_t tx_q_head;
+static uint8_t tx_q_tail;
+static uint8_t tx_q_count;
+K_MUTEX_DEFINE(tx_q_mutex);
 
 /* ===== Dedup Ring Buffer ===== */
 struct dedup_entry {
@@ -65,22 +83,80 @@ static bool dedup_check_and_insert(uint8_t origin_id, uint16_t seq_num)
     return false;
 }
 
+static bool tx_q_push(const uint8_t *data, uint16_t len)
+{
+    if (len == 0 || len > sizeof(tx_queue[0].buf)) {
+        return false;
+    }
+    bool ok = false;
+    k_mutex_lock(&tx_q_mutex, K_FOREVER);
+    if (tx_q_count < MESH_TX_QUEUE_SIZE) {
+        memcpy(tx_queue[tx_q_tail].buf, data, len);
+        tx_queue[tx_q_tail].len = len;
+        tx_q_tail = (tx_q_tail + 1) % MESH_TX_QUEUE_SIZE;
+        tx_q_count++;
+        ok = true;
+    }
+    k_mutex_unlock(&tx_q_mutex);
+    return ok;
+}
+
+static bool tx_q_pop(uint8_t *out, uint16_t *out_len)
+{
+    bool ok = false;
+    k_mutex_lock(&tx_q_mutex, K_FOREVER);
+    if (tx_q_count > 0) {
+        *out_len = tx_queue[tx_q_head].len;
+        memcpy(out, tx_queue[tx_q_head].buf, *out_len);
+        tx_q_head = (tx_q_head + 1) % MESH_TX_QUEUE_SIZE;
+        tx_q_count--;
+        ok = true;
+    }
+    k_mutex_unlock(&tx_q_mutex);
+    return ok;
+}
+
 static void do_coded_broadcast(const uint8_t *data, uint16_t len)
 {
     if (!coded_adv_set || len == 0) {
+        return;
+    }
+    if (!tx_q_push(data, len)) {
+        LOG_WRN("Mesh TX queue full, dropping %u byte broadcast", len);
+        return;
+    }
+    if (!atomic_get(&is_broadcasting)) {
+        k_work_submit(&tx_pump_work);
+    }
+}
+
+static void tx_pump_handler(struct k_work *work)
+{
+    if (atomic_get(&is_broadcasting)) {
+        return;
+    }
+
+    uint8_t buf[256];
+    uint16_t len;
+    if (!tx_q_pop(buf, &len)) {
+        mesh_start_scanner();
+        return;
+    }
+    if (!coded_adv_set) {
         return;
     }
 
     bt_le_scan_stop();
 
     struct bt_data ad[] = {
-        BT_DATA(BT_DATA_MANUFACTURER_DATA, data, len)
+        BT_DATA(BT_DATA_MANUFACTURER_DATA, buf, len)
     };
 
     int err = bt_le_ext_adv_set_data(coded_adv_set, ad, ARRAY_SIZE(ad), NULL, 0);
     if (err) {
         LOG_ERR("Coded PHY set data failed (err %d)", err);
         mesh_start_scanner();
+        k_work_submit(&tx_pump_work);
         return;
     }
 
@@ -92,6 +168,7 @@ static void do_coded_broadcast(const uint8_t *data, uint16_t len)
     if (err) {
         LOG_ERR("Coded PHY adv start failed (err %d)", err);
         mesh_start_scanner();
+        k_work_submit(&tx_pump_work);
         return;
     }
 
@@ -103,7 +180,7 @@ static void stop_adv_handler(struct k_work *work)
 {
     bt_le_ext_adv_stop(coded_adv_set);
     atomic_set(&is_broadcasting, 0);
-    mesh_start_scanner();
+    k_work_submit(&tx_pump_work);
 }
 
 static void repeat_work_handler(struct k_work *work)
@@ -196,12 +273,16 @@ static void relay_message(const uint8_t *data, uint16_t len)
 
 void mesh_init(void)
 {
+    k_work_init(&tx_pump_work, tx_pump_handler);
     k_work_init_delayable(&stop_adv_work, stop_adv_handler);
     k_work_init_delayable(&repeat_work, repeat_work_handler);
     k_work_init_delayable(&relay_work, relay_work_handler);
     memset(dedup_buf, 0, sizeof(dedup_buf));
     dedup_idx = 0;
     seq_counter = 0;
+    tx_q_head = 0;
+    tx_q_tail = 0;
+    tx_q_count = 0;
 }
 
 void mesh_set_identity(uint8_t player_id, uint8_t team_id)

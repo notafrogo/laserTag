@@ -32,8 +32,12 @@
 &pinctrl {
     pwm0_default: pwm0_default {
         group1 {
-            /* IR LED (PWM output, transistor-driven) is on P1.04 */
+            /* IR LED on P1.04. H0H1 high drive (~5 mA, vs ~0.5 mA standard)
+             * so the pin can source enough current for a direct-driven IR LED
+             * or hard-saturate the switching transistor.
+             */
             psels = <NRF_PSEL(PWM_OUT0, 1, 4)>;
+            nordic,drive-mode = <NRF_DRIVE_H0H1>;
         };
     };
 

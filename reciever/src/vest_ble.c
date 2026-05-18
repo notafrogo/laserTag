@@ -45,11 +45,6 @@ void vest_ble_init(vest_ble_cmd_cb_t cmd_cb)
     app_cmd_cb = cmd_cb;
 }
 
-const struct bt_gatt_attr *vest_ble_get_hit_tx_attr(void)
-{
-    return &vest_svc.attrs[2];
-}
-
 int vest_ble_notify_hit(struct bt_conn *conn, const uint8_t *data, uint16_t len)
 {
     if (!conn) {
