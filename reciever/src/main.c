@@ -67,7 +67,7 @@ static int led_tick;
 
 /* ===== Forward Declarations ===== */
 static void start_advertising(void);
-static void start_directed_advertising(void);
+static void start_pairing_scan(void);
 
 /* ===== LED ===== */
 
@@ -270,8 +270,8 @@ static void pairing_scan_recv(const struct bt_le_scan_recv_info *info,
                 bt_le_scan_stop();
                 current_state = VEST_PAIRED_IDLE;
 
-                /* Switch to directed advertising toward emitter */
-                start_directed_advertising();
+                /* Now paired — start advertising so emitter can discover us by name. */
+                start_advertising();
                 return;
             }
         }
@@ -289,15 +289,22 @@ static void unpair_pressed_cb(const struct device *dev, struct gpio_callback *cb
                                uint32_t pins)
 {
     LOG_INF("Unpair button pressed");
-    if (emitter_conn) {
-        bt_conn_disconnect(emitter_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-    }
+
+    /* Clear paired state BEFORE the disconnect so the disconnected callback
+     * routes to the unpaired branch (scan, not advertise).
+     */
     has_paired_addr = false;
     settings_delete("vest/emitter_addr");
     current_state = VEST_UNPAIRED;
     friendly_count = 0;
     hit_pending = false;
-    start_advertising();
+
+    if (emitter_conn) {
+        /* disconnected() will switch us back to pairing scan. */
+        bt_conn_disconnect(emitter_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+    } else {
+        start_pairing_scan();
+    }
 }
 #endif
 
@@ -334,9 +341,10 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
     }
 
     if (has_paired_addr) {
-        start_directed_advertising();
-    } else {
         start_advertising();
+    } else {
+        /* Unpair-button path lands here: drop back to scan-only. */
+        start_pairing_scan();
     }
 }
 
@@ -345,12 +353,23 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
     .disconnected = disconnected,
 };
 
-/* ===== Advertising ===== */
+/* ===== Advertising / Scanning =====
+ *
+ * Unpaired vests do NOT advertise — they only scan for the emitter's
+ * trigger-pull pairing broadcast. Otherwise the emitter (which discovers
+ * vests by name) would auto-connect to any unpaired vest in range without
+ * the pairing dance, and without storing the emitter↔vest binding.
+ *
+ * Once paired, the vest advertises connectable+scannable with its name so
+ * the emitter can find it. True directed advertising would be preferable
+ * here, but legacy directed adv carries no payload and the emitter relies
+ * on the "LT-V-" name prefix to identify vests, so we use undirected.
+ */
 
 static void start_advertising(void)
 {
-    /* Idempotent: stop any prior adv so we can switch modes cleanly. */
     bt_le_adv_stop();
+    bt_le_scan_stop();
 
     struct bt_data ad[] = {
         BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -364,37 +383,26 @@ static void start_advertising(void)
     if (err && err != -EALREADY) {
         LOG_ERR("Adv start failed (err %d)", err);
     } else {
-        LOG_INF("Generic advertising started");
+        LOG_INF("Advertising started (paired)");
     }
 }
 
-static void start_directed_advertising(void)
+static void start_pairing_scan(void)
 {
-    if (!has_paired_addr) {
-        start_advertising();
-        return;
-    }
-
-    /* Idempotent: stop any prior adv so we can switch modes cleanly. */
     bt_le_adv_stop();
 
-    /* Low-duty directed adv: only the paired emitter can establish a
-     * connection from this advertisement. Legacy directed adv carries no
-     * payload, so the device name is unavailable here — but the peer
-     * already knows our address from pairing.
-     */
-    struct bt_le_adv_param param = BT_LE_ADV_PARAM_INIT(
-        BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_DIR_MODE_LOW_DUTY,
-        BT_GAP_ADV_FAST_INT_MIN_2, BT_GAP_ADV_FAST_INT_MAX_2,
-        &paired_emitter_addr);
-
-    int err = bt_le_adv_start(&param, NULL, 0, NULL, 0);
-    if (err) {
-        LOG_ERR("Directed adv start failed (err %d), falling back to general", err);
-        start_advertising();
-        return;
+    struct bt_le_scan_param scan_param = {
+        .type     = BT_LE_SCAN_TYPE_PASSIVE,
+        .options  = 0,
+        .interval = 0x0060,
+        .window   = 0x0030,
+    };
+    int err = bt_le_scan_start(&scan_param, NULL);
+    if (err && err != -EALREADY) {
+        LOG_ERR("Pairing scan start failed (err %d)", err);
+    } else {
+        LOG_INF("Pairing scan started (unpaired, waiting for trigger-pull broadcast)");
     }
-    LOG_INF("Directed advertising started toward paired emitter");
 }
 
 /* ===== BT Ready ===== */
@@ -421,22 +429,11 @@ static void bt_ready(int err)
     bt_le_scan_cb_register(&scan_cbs);
 
     if (has_paired_addr) {
-        LOG_INF("Have paired emitter, starting directed advertising");
-        start_directed_advertising();
-    } else {
-        LOG_INF("No paired emitter, starting scan for pairing");
+        LOG_INF("Have paired emitter, advertising for reconnect");
         start_advertising();
-
-        struct bt_le_scan_param scan_param = {
-            .type     = BT_LE_SCAN_TYPE_PASSIVE,
-            .options  = 0,
-            .interval = 0x0060,
-            .window   = 0x0030,
-        };
-        err = bt_le_scan_start(&scan_param, NULL);
-        if (err) {
-            LOG_ERR("Pairing scan start failed (err %d)", err);
-        }
+    } else {
+        LOG_INF("No paired emitter, scanning for pairing broadcast");
+        start_pairing_scan();
     }
 }
 

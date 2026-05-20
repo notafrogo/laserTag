@@ -407,3 +407,12 @@ void ble_vest_disconnect(void)
         bt_conn_disconnect(vest_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
     }
 }
+
+bool ble_vest_get_active_mac(uint8_t mac_out[6])
+{
+    if (!vest_conn || !has_vest_mac) {
+        return false;
+    }
+    memcpy(mac_out, vest_mac, 6);
+    return true;
+}

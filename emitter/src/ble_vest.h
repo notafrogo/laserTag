@@ -33,4 +33,11 @@ int ble_vest_send_friendly_fire(uint8_t enabled);
 bool ble_vest_is_connected(void);
 void ble_vest_disconnect(void);
 
+/* If a vest is currently connected at BLE level, copy its 6-byte MAC into
+ * mac_out and return true. Used to re-notify the phone of vest pairing
+ * state when the phone (re)connects to the emitter after the vest is
+ * already paired.
+ */
+bool ble_vest_get_active_mac(uint8_t mac_out[6]);
+
 #endif

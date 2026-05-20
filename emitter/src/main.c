@@ -652,6 +652,19 @@ static void connected(struct bt_conn *conn, uint8_t err)
     phone_conn = bt_conn_ref(conn);
     mesh_set_phone_conn(phone_conn);
     gpio_pin_set_dt(&status_led, 1);
+
+    /* If a vest is already paired to us, the phone never saw the original
+     * RSP_VEST_PAIRED notification — it was dropped because phone_conn was
+     * NULL at the time. Re-send it now so the app can render vest state.
+     */
+    uint8_t vmac[6];
+    if (ble_vest_get_active_mac(vmac)) {
+        uint8_t buf[7];
+        buf[0] = RSP_VEST_PAIRED;
+        memcpy(&buf[1], vmac, 6);
+        phone_notify(buf, 7);
+        LOG_INF("Re-notified phone of already-paired vest");
+    }
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
