@@ -8,7 +8,7 @@
         compatible = "gpio-keys";
         trigger_button: trigger_button {
             /* Trigger switch is on P0.29 */
-            gpios = <&gpio0 29 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+            gpios = <&gpio0 29 (GPIO_ACTIVE_HIGH | GPIO_PULL_UP)>;
             label = "Trigger Button";
         };
     };

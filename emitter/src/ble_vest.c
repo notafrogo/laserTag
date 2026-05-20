@@ -315,7 +315,7 @@ static int vest_write(const uint8_t *data, uint16_t len)
     if (!vest_conn || cmd_rx_handle == 0) {
         return -ENOTCONN;
     }
-    return bt_gatt_write_without_resp(vest_conn, cmd_rx_handle, data, len, false);
+    return bt_gatt_write_without_response(vest_conn, cmd_rx_handle, data, len, false);
 }
 
 int ble_vest_send_hit_ack(uint16_t packet_id)

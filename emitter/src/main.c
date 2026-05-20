@@ -308,7 +308,6 @@ static void on_vest_disconnected(uint8_t reason)
 
 static void ir_tx_work_handler(struct k_work *work)
 {
-    const struct emitter_config *cfg = game_state_get_config();
     ir_packet_t pkt = {
         .player_id = local_player.player_id,
         .weapon_id = 0x00,
