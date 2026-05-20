@@ -4,6 +4,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/random/random.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/byteorder.h>
 
@@ -72,8 +73,16 @@ static uint8_t hit_dedup_idx;
 /* Trigger state */
 static bool trigger_ready = true;
 
+/* Pairing — one nonce per CMD_ENTER_PAIRING session, re-used across the
+ * IR burst. The emitter writes the same nonce over BLE once GATT is
+ * ready so the vest can verify the connecting emitter is the one that
+ * fired the IR pulse it just heard.
+ */
+static uint16_t current_pairing_nonce;
+
 /* ===== Timers / Work Items ===== */
 static struct k_work ir_tx_work;
+static struct k_work_delayable pairing_tx_work;
 static struct k_work_delayable trigger_work;
 static struct k_work_delayable reload_work;
 static struct k_work_delayable adv_work;
@@ -302,6 +311,45 @@ static void ir_tx_work_handler(struct k_work *work)
     ir_tx_send(&pkt);
 }
 
+/* Fires one pairing IR frame, then reschedules itself while the trigger
+ * is still held in EMITTER_PAIRING. Runs on the cooperative IR workqueue
+ * so the ~120 ms blocking TX doesn't stall the system workqueue and
+ * keeps deterministic pulse timing.
+ */
+static void pairing_tx_work_handler(struct k_work *work)
+{
+    if (current_state != EMITTER_PAIRING) {
+        return;
+    }
+    if (gpio_pin_get_dt(&trigger) != 1) {
+        return;
+    }
+
+    ir_pairing_packet_t pkt = {
+        .nonce     = current_pairing_nonce,
+        .player_id = local_player.player_id,
+    };
+    ir_tx_send_pairing(&pkt);
+
+    k_work_reschedule_for_queue(&ir_tx_q, &pairing_tx_work, K_NO_WAIT);
+}
+
+/* Called by ble_vest once GATT discovery + subscription complete. If we
+ * triggered this connection via the IR pairing flow, send the nonce now
+ * so the vest can verify and commit the pairing.
+ */
+static void on_vest_gatt_ready(void)
+{
+    if (current_state == EMITTER_PAIRING) {
+        int err = ble_vest_send_pair_confirm(current_pairing_nonce);
+        if (err) {
+            LOG_ERR("Pair confirm write failed (err %d)", err);
+        } else {
+            LOG_INF("Pair confirm sent (nonce=0x%04x)", current_pairing_nonce);
+        }
+    }
+}
+
 /* ===== Trigger Handling ===== */
 
 static void trigger_work_handler(struct k_work *work)
@@ -314,11 +362,12 @@ static void trigger_work_handler(struct k_work *work)
     }
 
     if (current_state == EMITTER_PAIRING) {
-        bt_addr_le_t addrs[1];
-        size_t count = 1;
-        bt_id_get(addrs, &count);
-        ble_vest_start_pairing_broadcast(addrs[0].a.val, local_player.player_id);
-        trigger_ready = false;
+        /* Fire IR pairing frames while the trigger is held. The handler
+         * reschedules itself until the trigger releases or we leave
+         * EMITTER_PAIRING. Submitting again while already pending is a
+         * no-op, so repeated trigger-press IRQs are harmless.
+         */
+        k_work_reschedule_for_queue(&ir_tx_q, &pairing_tx_work, K_NO_WAIT);
         return;
     }
 
@@ -547,11 +596,18 @@ static void on_phone_rx(const uint8_t *data, uint16_t len)
 
     case CMD_ENTER_PAIRING:
         current_state = EMITTER_PAIRING;
+        current_pairing_nonce = (uint16_t)(sys_rand32_get() & 0xFFFF);
         phone_ack(RSP_PAIRING_ACK);
-        LOG_INF("Pairing mode: pull trigger near vest");
+        LOG_INF("Pairing mode: shoot the vest (nonce=0x%04x)", current_pairing_nonce);
         break;
 
     case CMD_UNPAIR_VEST:
+        /* Tell the vest to clear its NVS first so it doesn't auto-reconnect
+         * after we drop the link.
+         */
+        if (ble_vest_is_connected()) {
+            ble_vest_send_unpair();
+        }
         ble_vest_disconnect();
         break;
 
@@ -749,6 +805,7 @@ int main(void)
 
     /* Work items */
     k_work_init(&ir_tx_work, ir_tx_work_handler);
+    k_work_init_delayable(&pairing_tx_work, pairing_tx_work_handler);
     k_work_init_delayable(&trigger_work, trigger_work_handler);
     k_work_init_delayable(&reload_work, reload_work_handler);
     k_work_init_delayable(&adv_work, adv_work_handler);
@@ -770,7 +827,8 @@ int main(void)
     mesh_init();
 
     /* Vest BLE central */
-    ble_vest_init(on_vest_hit, on_vest_connected, on_vest_disconnected);
+    ble_vest_init(on_vest_hit, on_vest_connected, on_vest_disconnected,
+                  on_vest_gatt_ready);
 
     /* Settings */
     settings_subsys_init();

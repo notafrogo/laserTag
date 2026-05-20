@@ -26,6 +26,7 @@ static uint16_t cmd_rx_handle;
 static ble_vest_hit_cb_t hit_cb;
 static ble_vest_connected_cb_t connected_cb;
 static ble_vest_disconnected_cb_t disconnected_cb;
+static ble_vest_ready_cb_t ready_cb;
 static uint8_t vest_mac[6];
 static bool has_vest_mac;
 
@@ -43,9 +44,18 @@ static uint16_t svc_start_handle;
 static uint16_t svc_end_handle;
 static uint16_t hit_tx_value_handle;
 
-/* Pairing broadcast */
-static struct bt_le_ext_adv *pairing_adv_set;
-static struct k_work_delayable pairing_stop_work;
+/* Deferred firing of ready_cb — runs on system workqueue so the callback
+ * (which typically issues another GATT write) doesn't execute inside the
+ * BT host thread's discovery callback.
+ */
+static struct k_work ready_cb_work;
+
+static void ready_cb_handler(struct k_work *work)
+{
+    if (ready_cb) {
+        ready_cb();
+    }
+}
 
 /* Forward declarations */
 static uint8_t gatt_discover_cb(struct bt_conn *conn,
@@ -146,6 +156,7 @@ static uint8_t gatt_discover_cb(struct bt_conn *conn,
             } else {
                 LOG_INF("Subscribed to vest Hit TX");
                 disc_stage = DISC_DONE;
+                k_work_submit(&ready_cb_work);
             }
             return BT_GATT_ITER_STOP;
         }
@@ -252,69 +263,16 @@ static void vest_scan_connect(const bt_addr_le_t *addr)
     LOG_INF("Connecting to vest...");
 }
 
-/* ===== Pairing Broadcast ===== */
-
-static void pairing_stop_handler(struct k_work *work)
-{
-    if (pairing_adv_set) {
-        bt_le_ext_adv_stop(pairing_adv_set);
-        LOG_INF("Pairing broadcast stopped");
-    }
-}
-
 void ble_vest_init(ble_vest_hit_cb_t hit_callback,
                    ble_vest_connected_cb_t conn_cb,
-                   ble_vest_disconnected_cb_t disc_cb)
+                   ble_vest_disconnected_cb_t disc_cb,
+                   ble_vest_ready_cb_t rdy_cb)
 {
     hit_cb = hit_callback;
     connected_cb = conn_cb;
     disconnected_cb = disc_cb;
-    k_work_init_delayable(&pairing_stop_work, pairing_stop_handler);
-}
-
-void ble_vest_start_pairing_broadcast(const uint8_t *emitter_mac, uint8_t player_id)
-{
-    if (!pairing_adv_set) {
-        struct bt_le_adv_param param = {
-            .id = BT_ID_DEFAULT,
-            .sid = 2,
-            .secondary_max_skip = 0,
-            .options = BT_LE_ADV_OPT_EXT_ADV,
-            .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
-            .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
-            .peer = NULL,
-        };
-        int err = bt_le_ext_adv_create(&param, NULL, &pairing_adv_set);
-        if (err) {
-            LOG_ERR("Pairing adv set create failed (err %d)", err);
-            return;
-        }
-    }
-
-    uint8_t pairing_data[PAIRING_ADV_SIZE];
-    pairing_data[0] = PAIRING_FLAG;
-    memcpy(&pairing_data[1], emitter_mac, 6);
-    pairing_data[7] = player_id;
-
-    struct bt_data ad[] = {
-        BT_DATA(BT_DATA_MANUFACTURER_DATA, pairing_data, PAIRING_ADV_SIZE),
-    };
-
-    int err = bt_le_ext_adv_set_data(pairing_adv_set, ad, ARRAY_SIZE(ad), NULL, 0);
-    if (err) {
-        LOG_ERR("Pairing adv set data failed (err %d)", err);
-        return;
-    }
-
-    struct bt_le_ext_adv_start_param start = { .timeout = 200, .num_events = 0 };
-    err = bt_le_ext_adv_start(pairing_adv_set, &start);
-    if (err) {
-        LOG_ERR("Pairing adv start failed (err %d)", err);
-        return;
-    }
-
-    LOG_INF("Pairing broadcast started (~2s)");
-    k_work_reschedule(&pairing_stop_work, K_MSEC(2000));
+    ready_cb = rdy_cb;
+    k_work_init(&ready_cb_work, ready_cb_handler);
 }
 
 void ble_vest_on_scan_result(const bt_addr_le_t *addr, int8_t rssi,
@@ -394,6 +352,20 @@ int ble_vest_send_friendly_fire(uint8_t enabled)
 {
     uint8_t buf[2] = { VEST_CMD_FRIENDLY_FIRE, enabled };
     return vest_write(buf, 2);
+}
+
+int ble_vest_send_pair_confirm(uint16_t nonce)
+{
+    uint8_t buf[3];
+    buf[0] = VEST_CMD_PAIR_CONFIRM;
+    sys_put_le16(nonce, &buf[1]);
+    return vest_write(buf, 3);
+}
+
+int ble_vest_send_unpair(void)
+{
+    uint8_t buf[1] = { VEST_CMD_UNPAIR };
+    return vest_write(buf, 1);
 }
 
 bool ble_vest_is_connected(void)
