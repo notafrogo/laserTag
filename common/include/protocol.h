@@ -35,8 +35,9 @@
 #define RSP_LOCATION_ACK        0x95
 #define RSP_MESH_STATS_ACK      0x96
 #define RSP_PAIRING_ACK         0x97
-#define RSP_VEST_PAIRED         0x98
+#define RSP_VEST_PAIRED         0x98  /* payload: vest MAC[6] */
 #define RSP_RESPAWN_ACK         0x99
+#define RSP_VEST_DISCONNECTED   0x9A  /* payload: BT HCI reason (1 byte) */
 #define RSP_STATE_UPDATE        0xA0
 #define RSP_DEATH_NOTIFY        0xA1
 

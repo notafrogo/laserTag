@@ -286,16 +286,22 @@ static void on_vest_hit(uint16_t packet_id, uint8_t shooter_id,
 
 static void on_vest_connected(const uint8_t *mac)
 {
-    uint8_t buf[7];
-    buf[0] = RSP_VEST_PAIRED;
-    memcpy(&buf[1], mac, 6);
-    phone_notify(buf, 7);
-    LOG_INF("Vest paired, notified phone");
+    /* BLE link is up but GATT discovery isn't done yet — defer the
+     * RSP_VEST_PAIRED notification to on_vest_gatt_ready so the phone
+     * doesn't see "paired" before commands actually flow. The mac is
+     * kept in ble_vest's state and pulled later via ble_vest_get_active_mac.
+     */
+    (void)mac;
+    LOG_INF("Vest BLE connected, awaiting GATT");
 }
 
-static void on_vest_disconnected(void)
+static void on_vest_disconnected(uint8_t reason)
 {
-    LOG_WRN("Vest disconnected");
+    LOG_WRN("Vest disconnected (reason %u)", reason);
+    if (phone_conn) {
+        uint8_t buf[2] = { RSP_VEST_DISCONNECTED, reason };
+        phone_notify(buf, 2);
+    }
 }
 
 /* ===== IR TX Work ===== */
@@ -334,9 +340,12 @@ static void pairing_tx_work_handler(struct k_work *work)
     k_work_reschedule_for_queue(&ir_tx_q, &pairing_tx_work, K_NO_WAIT);
 }
 
-/* Called by ble_vest once GATT discovery + subscription complete. If we
- * triggered this connection via the IR pairing flow, send the nonce now
- * so the vest can verify and commit the pairing.
+/* Called by ble_vest once GATT discovery + subscription complete and
+ * commands can flow. This is where we send VEST_CMD_PAIR_CONFIRM (if we
+ * triggered the connection via IR pairing) and where we notify the
+ * phone that the vest is paired. Doing it here, not on raw BLE connect,
+ * avoids the race where the app saw "paired" before the link was
+ * actually usable.
  */
 static void on_vest_gatt_ready(void)
 {
@@ -347,6 +356,15 @@ static void on_vest_gatt_ready(void)
         } else {
             LOG_INF("Pair confirm sent (nonce=0x%04x)", current_pairing_nonce);
         }
+    }
+
+    uint8_t vmac[6];
+    if (ble_vest_get_active_mac(vmac)) {
+        uint8_t buf[7];
+        buf[0] = RSP_VEST_PAIRED;
+        memcpy(&buf[1], vmac, 6);
+        phone_notify(buf, 7);
+        LOG_INF("Vest paired, notified phone");
     }
 }
 

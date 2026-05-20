@@ -10,7 +10,7 @@
 typedef void (*ble_vest_hit_cb_t)(uint16_t packet_id, uint8_t shooter_id,
                                   uint8_t weapon_id, uint8_t team_id);
 typedef void (*ble_vest_connected_cb_t)(const uint8_t *vest_mac);
-typedef void (*ble_vest_disconnected_cb_t)(void);
+typedef void (*ble_vest_disconnected_cb_t)(uint8_t reason);
 /* Fired once GATT discovery + subscription have completed and writes to
  * the vest's command characteristic will succeed. Used by the emitter to
  * send VEST_CMD_PAIR_CONFIRM at the right moment.

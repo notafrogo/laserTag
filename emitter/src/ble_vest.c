@@ -221,7 +221,7 @@ static void vest_conn_disconnected(struct bt_conn *conn, uint8_t reason)
         mesh_start_scanner();
 
         if (disconnected_cb) {
-            disconnected_cb();
+            disconnected_cb(reason);
         }
     }
 }
