@@ -27,12 +27,24 @@ uint8_t crc8_calc(const uint8_t *data, size_t len)
 /* ===== TX ===== */
 
 static const struct device *tx_pwm;
-static uint32_t tx_carrier_period = 26;
+static uint32_t tx_carrier_period_ns = 26315;  /* 38 kHz */
 
 void ir_tx_init(const struct device *pwm_dev, uint32_t carrier_period_us)
 {
     tx_pwm = pwm_dev;
-    tx_carrier_period = carrier_period_us;
+    /* carrier_period_us was being passed straight into pwm_set_cycles, which
+     * takes PWM ticks at the driver's base clock — NOT microseconds. On
+     * nRF52 that base is typically 16 MHz, so "26" produced ~615 kHz, far
+     * outside the VS1838B band. Convert to nanoseconds and use pwm_set
+     * (driver converts to the right cycle count for its base clock).
+     */
+    tx_carrier_period_ns = carrier_period_us * 1000UL;
+
+    uint64_t cps = 0;
+    pwm_get_cycles_per_sec(tx_pwm, 0, &cps);
+    LOG_INF("IR TX init: pwm cycles/sec=%llu, carrier period=%uns (%u Hz)",
+            cps, tx_carrier_period_ns,
+            tx_carrier_period_ns ? (1000000000U / tx_carrier_period_ns) : 0);
 }
 
 static void tx_raw(const uint8_t *bytes, size_t len)
@@ -40,16 +52,18 @@ static void tx_raw(const uint8_t *bytes, size_t len)
     if (!tx_pwm) {
         return;
     }
+    uint32_t period = tx_carrier_period_ns;
+    uint32_t pulse  = period / 2;
     for (size_t i = 0; i < len; i++) {
         for (int j = 0; j < 8; j++) {
             bool bit = (bytes[i] >> j) & 1;
-            pwm_set_cycles(tx_pwm, 0, tx_carrier_period, tx_carrier_period / 2, 0);
+            pwm_set(tx_pwm, 0, period, pulse, 0);   /* carrier ON  */
             k_msleep(1);
-            pwm_set_cycles(tx_pwm, 0, tx_carrier_period, 0, 0);
+            pwm_set(tx_pwm, 0, period, 0, 0);       /* carrier OFF */
             k_msleep(bit ? 3 : 1);
         }
     }
-    pwm_set_cycles(tx_pwm, 0, tx_carrier_period, 0, 0);
+    pwm_set(tx_pwm, 0, period, 0, 0);
 }
 
 void ir_tx_send(const ir_packet_t *packet)
