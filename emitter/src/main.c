@@ -664,6 +664,20 @@ static void scan_recv(const struct bt_le_scan_recv_info *info, struct net_buf_si
         return;
     }
 
+    /* Diagnostic: log every adv we receive (rate-limited) so we can tell
+     * which PHYs and which devices are reaching the scanner. primary_phy
+     * is 0x01 for 1M, 0x03 for Coded — if we never see 0x01 here, the
+     * Coded-only scanner theory is correct and the vest's 1M ads aren't
+     * making it through.
+     */
+    static uint32_t adv_log_count;
+    if ((adv_log_count++ & 0x1F) == 0) {
+        char addr_str[BT_ADDR_LE_STR_LEN];
+        bt_addr_le_to_str(info->addr, addr_str, sizeof(addr_str));
+        LOG_INF("scan_recv: addr=%s rssi=%d phy=%u len=%u",
+                addr_str, info->rssi, info->primary_phy, buf->len);
+    }
+
     /* Vest discovery on 1M PHY (during pairing or reconnection) */
     if (current_state == EMITTER_PAIRING || !ble_vest_is_connected()) {
         ble_vest_on_scan_result(info->addr, info->rssi, buf);

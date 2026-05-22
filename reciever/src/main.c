@@ -138,7 +138,8 @@ static void pair_confirm_timeout_handler(struct k_work *work)
 static void on_ir_pairing(const ir_pairing_packet_t *pkt)
 {
     if (current_state != VEST_UNPAIRED) {
-        LOG_DBG("IR pairing ignored (state=%d)", current_state);
+        LOG_INF("IR pairing ignored (state=%d) — vest believes it is already paired",
+                current_state);
         return;
     }
 
