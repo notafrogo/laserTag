@@ -73,12 +73,14 @@ static uint8_t hit_dedup_idx;
 /* Trigger state */
 static bool trigger_ready = true;
 
-/* Pairing — one nonce per CMD_ENTER_PAIRING session, re-used across the
- * IR burst. The emitter writes the same nonce over BLE once GATT is
- * ready so the vest can verify the connecting emitter is the one that
- * fired the IR pulse it just heard.
+/* Pairing — the lowest 2 bytes of our own BLE address. Sent in every
+ * IR pairing frame so the vest can match the connecting emitter's BLE
+ * address against the IR-supplied value at connected() time. No BLE
+ * round-trip / PAIR_CONFIRM write required.
+ *
+ * Cached once in bt_ready after bt_id_get.
  */
-static uint16_t current_pairing_nonce;
+static uint16_t emitter_addr_lsbs;
 
 /* ===== Timers / Work Items ===== */
 static struct k_work ir_tx_work;
@@ -329,19 +331,19 @@ static void pairing_tx_work_handler(struct k_work *work)
     if (gpio_pin_get_dt(&trigger) != 1) {
         return;
     }
-    /* Once the BLE link to the vest is up, stop firing. Continuing to
-     * blast IR from this cooperative workqueue while GATT discovery and
-     * the pair-confirm write are in flight starves the system workqueue
-     * and BT host, and the vest never receives VEST_CMD_PAIR_CONFIRM
-     * before its 5s timeout. The user is free to keep holding the
-     * trigger — we just don't need IR anymore once we have a link.
+    /* Once the BLE link to the vest is up, stop firing. The vest has
+     * already extracted the pairing identity (our MAC LSBs) from the IR
+     * frame it received before connecting; continuing to blast IR from
+     * this cooperative workqueue just contends with the system workqueue
+     * and BT host. The user is free to keep holding the trigger — we
+     * just don't need IR anymore once we have a link.
      */
     if (ble_vest_link_up()) {
         return;
     }
 
     ir_pairing_packet_t pkt = {
-        .nonce     = current_pairing_nonce,
+        .addr_lsbs = emitter_addr_lsbs,
         .player_id = local_player.player_id,
     };
     ir_tx_send_pairing(&pkt);
@@ -350,23 +352,15 @@ static void pairing_tx_work_handler(struct k_work *work)
 }
 
 /* Called by ble_vest once GATT discovery + subscription complete and
- * commands can flow. This is where we send VEST_CMD_PAIR_CONFIRM (if we
- * triggered the connection via IR pairing) and where we notify the
- * phone that the vest is paired. Doing it here, not on raw BLE connect,
- * avoids the race where the app saw "paired" before the link was
- * actually usable.
+ * commands can flow. Pairing identity is verified by the vest at
+ * connected() time using the BLE address we embed in the IR pairing
+ * frame, so there's no PAIR_CONFIRM write here. We just notify the
+ * phone that the vest is paired and ready — doing it after GATT-ready
+ * (not on raw BLE-connect) means the phone sees "paired" only once
+ * commands can actually flow.
  */
 static void on_vest_gatt_ready(void)
 {
-    if (current_state == EMITTER_PAIRING) {
-        int err = ble_vest_send_pair_confirm(current_pairing_nonce);
-        if (err) {
-            LOG_ERR("Pair confirm write failed (err %d)", err);
-        } else {
-            LOG_INF("Pair confirm sent (nonce=0x%04x)", current_pairing_nonce);
-        }
-    }
-
     uint8_t vmac[6];
     if (ble_vest_get_active_mac(vmac)) {
         uint8_t buf[7];
@@ -623,9 +617,8 @@ static void on_phone_rx(const uint8_t *data, uint16_t len)
 
     case CMD_ENTER_PAIRING:
         current_state = EMITTER_PAIRING;
-        current_pairing_nonce = (uint16_t)(sys_rand32_get() & 0xFFFF);
         phone_ack(RSP_PAIRING_ACK);
-        LOG_INF("Pairing mode: shoot the vest (nonce=0x%04x)", current_pairing_nonce);
+        LOG_INF("Pairing mode: shoot the vest (addr_lsbs=0x%04x)", emitter_addr_lsbs);
         break;
 
     case CMD_UNPAIR_VEST:
@@ -695,8 +688,7 @@ static void scan_recv(const struct bt_le_scan_recv_info *info, struct net_buf_si
      * and OS-level adverts. If we let 1M traffic through, every nearby
      * Apple device's adv gets misparsed as a mesh packet, dedup-cached,
      * and forwarded to the phone over GATT — saturating the BT host's
-     * notify queue and blocking GATT writes like VEST_CMD_PAIR_CONFIRM
-     * from going out to the vest.
+     * notify queue and blocking downstream GATT operations.
      *
      * Also: buf->data is the full BLE AD-record blob, not the raw mesh
      * payload. We need to walk records and pull out the
@@ -813,16 +805,19 @@ static void bt_ready(int err)
         return;
     }
 
-    /* Set device name: LT-E-XXXX */
+    /* Set device name: LT-E-XXXX and cache the lowest 2 address bytes
+     * for inclusion in IR pairing frames. */
     bt_addr_le_t addrs[1];
     size_t count = 1;
     bt_id_get(addrs, &count);
     if (count > 0) {
         snprintf(adv_name, sizeof(adv_name), "LT-E-%02X%02X",
                  addrs[0].a.val[1], addrs[0].a.val[0]);
+        emitter_addr_lsbs = (uint16_t)addrs[0].a.val[0] |
+                            ((uint16_t)addrs[0].a.val[1] << 8);
     }
     bt_set_name(adv_name);
-    LOG_INF("Device name: %s", adv_name);
+    LOG_INF("Device name: %s (addr_lsbs=0x%04x)", adv_name, emitter_addr_lsbs);
 
     start_advertising();
 

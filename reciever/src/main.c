@@ -47,15 +47,16 @@ static char adv_name[11] = "LT-V-0000";
 static bt_addr_le_t paired_emitter_addr;
 static bool has_paired_addr;
 
-/* IR-pairing in flight: vest heard a pairing IR frame and is waiting for
- * the emitter to confirm the nonce over BLE. Cleared on success, on
- * mismatch, or on the pair-confirm timeout.
+/* IR-pairing in flight: vest heard a pairing IR frame and is now
+ * advertising, waiting for the emitter named in the IR payload to
+ * connect. The connecting peer's BLE address is matched against
+ * expected_addr_lsbs in connected(). No GATT round-trip required.
  */
-static uint16_t pending_nonce;
+static uint16_t expected_addr_lsbs;       /* IR-supplied low 2 bytes of emitter MAC */
 static uint8_t  pending_emitter_player_id;
-static bool     nonce_pending;
-static struct k_work_delayable pair_confirm_timeout_work;
-#define PAIR_CONFIRM_TIMEOUT_MS 5000
+static bool     pair_pending;
+static struct k_work_delayable pair_pending_timeout_work;
+#define PAIR_PENDING_TIMEOUT_MS 30000     /* 30 s — plenty of time for emitter to connect */
 
 /* Friendly list */
 static uint8_t friendly_ids[MAX_PLAYERS];
@@ -117,13 +118,13 @@ static bool is_friendly(uint8_t player_id)
 
 /* ===== IR Pairing ===== */
 
-static void pair_confirm_timeout_handler(struct k_work *work)
+static void pair_pending_timeout_handler(struct k_work *work)
 {
-    if (has_paired_addr || !nonce_pending) {
+    if (has_paired_addr || !pair_pending) {
         return;
     }
-    LOG_WRN("Pair-confirm timeout, reverting to UNPAIRED");
-    nonce_pending = false;
+    LOG_WRN("Pair-pending timeout — no matching emitter connected, reverting to UNPAIRED");
+    pair_pending = false;
     if (emitter_conn) {
         bt_conn_disconnect(emitter_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
     } else {
@@ -132,8 +133,13 @@ static void pair_confirm_timeout_handler(struct k_work *work)
 }
 
 /* IR pairing frame received. Strict policy: only acts when fully
- * unpaired. We don't commit anything until the emitter confirms the
- * same nonce over the BLE link.
+ * unpaired. The frame carries the emitter's own BLE address bytes 0-1;
+ * we store them and verify the connecting peer's MAC at connected()
+ * time, so no GATT round-trip is needed to confirm pairing identity.
+ *
+ * If a second IR frame arrives while we're already pair-pending we
+ * ignore it — first IR wins. This prevents a neighboring emitter in
+ * pairing mode from clobbering the binding we're about to commit.
  */
 static void on_ir_pairing(const ir_pairing_packet_t *pkt)
 {
@@ -142,20 +148,24 @@ static void on_ir_pairing(const ir_pairing_packet_t *pkt)
                 current_state);
         return;
     }
+    if (pair_pending) {
+        LOG_DBG("IR pairing ignored — already pair-pending");
+        return;
+    }
 
-    LOG_INF("IR pairing received: nonce=0x%04x emitter_pid=%d",
-            pkt->nonce, pkt->player_id);
+    LOG_INF("IR pairing received: emitter_addr_lsbs=0x%04x emitter_pid=%d",
+            pkt->addr_lsbs, pkt->player_id);
 
-    pending_nonce = pkt->nonce;
+    expected_addr_lsbs = pkt->addr_lsbs;
     pending_emitter_player_id = pkt->player_id;
-    nonce_pending = true;
+    pair_pending = true;
 
     /* Start advertising so the emitter can find us by name and connect.
-     * On the next inbound connection, we expect VEST_CMD_PAIR_CONFIRM
-     * with this nonce within PAIR_CONFIRM_TIMEOUT_MS.
+     * In connected() we'll compare the peer's MAC to expected_addr_lsbs
+     * and either commit the pairing (match) or disconnect (mismatch).
      */
     start_advertising();
-    k_work_reschedule(&pair_confirm_timeout_work, K_MSEC(PAIR_CONFIRM_TIMEOUT_MS));
+    k_work_reschedule(&pair_pending_timeout_work, K_MSEC(PAIR_PENDING_TIMEOUT_MS));
 }
 
 /* ===== Hit Retry ===== */
@@ -280,48 +290,15 @@ static void on_emitter_cmd(const uint8_t *data, uint16_t len)
         }
         break;
 
-    case VEST_CMD_PAIR_CONFIRM: {
-        if (len < 3 || !nonce_pending || !emitter_conn) {
-            LOG_WRN("Pair confirm: invalid (len=%u pending=%d conn=%d)",
-                    len, nonce_pending, emitter_conn != NULL);
-            if (emitter_conn) {
-                bt_conn_disconnect(emitter_conn, BT_HCI_ERR_AUTH_FAIL);
-            }
-            break;
-        }
-        uint16_t confirm_nonce = sys_get_le16(&data[1]);
-        if (confirm_nonce != pending_nonce) {
-            LOG_WRN("Pair confirm: nonce mismatch (got 0x%04x, expected 0x%04x)",
-                    confirm_nonce, pending_nonce);
-            nonce_pending = false;
-            k_work_cancel_delayable(&pair_confirm_timeout_work);
-            bt_conn_disconnect(emitter_conn, BT_HCI_ERR_AUTH_FAIL);
-            break;
-        }
-        /* Commit the binding: the BLE peer address of the emitter that
-         * just confirmed the IR nonce is the one we're now paired with.
-         */
-        bt_addr_le_copy(&paired_emitter_addr, bt_conn_get_dst(emitter_conn));
-        has_paired_addr = true;
-        nonce_pending = false;
-        current_state = VEST_PAIRED_IDLE;
-        settings_save_one("vest/emitter_addr",
-                          &paired_emitter_addr, sizeof(paired_emitter_addr));
-        k_work_cancel_delayable(&pair_confirm_timeout_work);
-        LOG_INF("Pair confirmed, committed to NVS (emitter pid=%d)",
-                pending_emitter_player_id);
-        break;
-    }
-
     case VEST_CMD_UNPAIR:
         LOG_INF("Unpair command received, clearing NVS");
         settings_delete("vest/emitter_addr");
         has_paired_addr = false;
-        nonce_pending = false;
+        pair_pending = false;
         current_state = VEST_UNPAIRED;
         friendly_count = 0;
         hit_pending = false;
-        k_work_cancel_delayable(&pair_confirm_timeout_work);
+        k_work_cancel_delayable(&pair_pending_timeout_work);
         if (emitter_conn) {
             bt_conn_disconnect(emitter_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
         }
@@ -340,10 +317,12 @@ static void unpair_pressed_cb(const struct device *dev, struct gpio_callback *cb
      * routes to the unpaired branch (scan, not advertise).
      */
     has_paired_addr = false;
+    pair_pending = false;
     settings_delete("vest/emitter_addr");
     current_state = VEST_UNPAIRED;
     friendly_count = 0;
     hit_pending = false;
+    k_work_cancel_delayable(&pair_pending_timeout_work);
 
     if (emitter_conn) {
         /* disconnected() will switch us back to pairing scan. */
@@ -366,18 +345,54 @@ static void connected(struct bt_conn *conn, uint8_t err)
     char addr_str[BT_ADDR_LE_STR_LEN];
     bt_addr_le_to_str(peer, addr_str, sizeof(addr_str));
 
-    /* If we're already paired, only the bound emitter is allowed in.
-     * Initial-pair traffic lands here with has_paired_addr == false and
-     * is gated instead by the VEST_CMD_PAIR_CONFIRM nonce check.
-     */
-    if (has_paired_addr && bt_addr_le_cmp(peer, &paired_emitter_addr) != 0) {
-        LOG_WRN("Reject connection from non-paired peer %s", addr_str);
-        bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
+    if (has_paired_addr) {
+        /* Reconnect path: only the bound emitter is allowed in. */
+        if (bt_addr_le_cmp(peer, &paired_emitter_addr) != 0) {
+            LOG_WRN("Reject connection from non-paired peer %s", addr_str);
+            bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
+            return;
+        }
+        LOG_INF("Emitter reconnected: %s", addr_str);
+        emitter_conn = bt_conn_ref(conn);
         return;
     }
 
-    LOG_INF("Emitter connected: %s", addr_str);
-    emitter_conn = bt_conn_ref(conn);
+    if (pair_pending) {
+        /* Initial-pair path: the IR pairing frame named the emitter's
+         * BLE address. Verify the connecting peer matches that name
+         * before committing. A mismatch means someone else (a stranger
+         * emitter, a debug tool) connected during our pair-pending
+         * window — reject and stay open for the real emitter.
+         */
+        uint16_t peer_lsbs = (uint16_t)peer->a.val[0] |
+                             ((uint16_t)peer->a.val[1] << 8);
+        if (peer_lsbs != expected_addr_lsbs) {
+            LOG_WRN("Reject pairing connection from %s (peer_lsbs=0x%04x, expected=0x%04x)",
+                    addr_str, peer_lsbs, expected_addr_lsbs);
+            bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
+            return;
+        }
+
+        /* MAC matches — commit the binding. */
+        bt_addr_le_copy(&paired_emitter_addr, peer);
+        has_paired_addr = true;
+        pair_pending = false;
+        current_state = VEST_PAIRED_IDLE;
+        settings_save_one("vest/emitter_addr",
+                          &paired_emitter_addr, sizeof(paired_emitter_addr));
+        k_work_cancel_delayable(&pair_pending_timeout_work);
+        emitter_conn = bt_conn_ref(conn);
+        LOG_INF("Paired via IR-supplied MAC, committed to NVS: %s (emitter pid=%d)",
+                addr_str, pending_emitter_player_id);
+        return;
+    }
+
+    /* Not paired and not pair-pending — we shouldn't be advertising in
+     * this state. Drop any stray inbound connection.
+     */
+    LOG_WRN("Unexpected connection in UNPAIRED non-pending state from %s — dropping",
+            addr_str);
+    bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -396,8 +411,14 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
     if (has_paired_addr) {
         start_advertising();
+    } else if (pair_pending) {
+        /* A non-matching peer connected and was rejected — keep
+         * advertising so the IR-supplied emitter can still connect
+         * within the pair-pending window.
+         */
+        start_advertising();
     } else {
-        /* Unpair-button path lands here: drop back to scan-only. */
+        /* Unpair-button path lands here: drop back to listening for IR. */
         start_pairing_scan();
     }
 }
@@ -527,8 +548,8 @@ int main(void)
     /* Hit retry work */
     k_work_init_delayable(&hit_retry_work, hit_retry_handler);
 
-    /* Pair-confirm timeout (reverts to UNPAIRED if no nonce arrives) */
-    k_work_init_delayable(&pair_confirm_timeout_work, pair_confirm_timeout_handler);
+    /* Pair-pending timeout (reverts to UNPAIRED if no matching emitter connects) */
+    k_work_init_delayable(&pair_pending_timeout_work, pair_pending_timeout_handler);
 
     /* NVS settings */
     settings_subsys_init();

@@ -11,9 +11,10 @@ typedef void (*ble_vest_hit_cb_t)(uint16_t packet_id, uint8_t shooter_id,
                                   uint8_t weapon_id, uint8_t team_id);
 typedef void (*ble_vest_connected_cb_t)(const uint8_t *vest_mac);
 typedef void (*ble_vest_disconnected_cb_t)(uint8_t reason);
-/* Fired once GATT discovery + subscription have completed and writes to
- * the vest's command characteristic will succeed. Used by the emitter to
- * send VEST_CMD_PAIR_CONFIRM at the right moment.
+/* Fired once GATT discovery + subscription have completed and the link
+ * is fully usable. Used by the emitter to notify the phone via
+ * RSP_VEST_PAIRED at the right moment — after the connection is
+ * actually ready to carry commands, not the instant BLE links up.
  */
 typedef void (*ble_vest_ready_cb_t)(void);
 
@@ -33,7 +34,6 @@ int ble_vest_send_friendly_list(const uint8_t *player_ids, uint8_t count);
 int ble_vest_send_death(void);
 int ble_vest_send_respawn(void);
 int ble_vest_send_friendly_fire(uint8_t enabled);
-int ble_vest_send_pair_confirm(uint16_t nonce);
 int ble_vest_send_unpair(void);
 
 bool ble_vest_is_connected(void);

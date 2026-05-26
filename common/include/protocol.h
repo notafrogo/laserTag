@@ -47,8 +47,9 @@
 #define VEST_CMD_DEATH          0x03
 #define VEST_CMD_RESPAWN        0x04
 #define VEST_CMD_FRIENDLY_FIRE  0x05
-#define VEST_CMD_PAIR_CONFIRM   0x06  /* payload: nonce[2] LE — finalizes IR pairing */
 #define VEST_CMD_UNPAIR         0x07  /* no payload — clears NVS, returns to UNPAIRED */
+/* 0x06 reserved (was VEST_CMD_PAIR_CONFIRM in the nonce-based design,
+ * removed when pairing identity moved entirely into the IR payload). */
 
 /* ===== Mesh Message Types ===== */
 #define MESH_LOBBY_ANNOUNCE     0x01

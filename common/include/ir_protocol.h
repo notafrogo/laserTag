@@ -19,10 +19,16 @@ typedef struct {
 } ir_packet_t;
 
 /* Pairing packet: 5 bytes on the wire
- * (IR_PAIRING_PREAMBLE + nonce[2] LE + player_id + CRC-8)
+ * (IR_PAIRING_PREAMBLE + addr_lsbs[2] LE + player_id + CRC-8)
+ *
+ * addr_lsbs carries the emitter's own BLE address bytes [0] and [1]
+ * (the same two bytes the LT-E-XXXX name suffix encodes). The vest
+ * verifies the connecting emitter's BLE address against this value at
+ * connected() time — no GATT round-trip needed to bind pairing to the
+ * physically-aimed emitter.
  */
 typedef struct {
-    uint16_t nonce;
+    uint16_t addr_lsbs;
     uint8_t  player_id;
 } ir_pairing_packet_t;
 

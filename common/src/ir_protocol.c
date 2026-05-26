@@ -77,8 +77,8 @@ void ir_tx_send_pairing(const ir_pairing_packet_t *packet)
 {
     uint8_t buffer[IR_PAIRING_PACKET_LEN];
     buffer[0] = IR_PAIRING_PREAMBLE;
-    buffer[1] = (uint8_t)(packet->nonce & 0xFF);
-    buffer[2] = (uint8_t)((packet->nonce >> 8) & 0xFF);
+    buffer[1] = (uint8_t)(packet->addr_lsbs & 0xFF);
+    buffer[2] = (uint8_t)((packet->addr_lsbs >> 8) & 0xFF);
     buffer[3] = packet->player_id;
     buffer[4] = crc8_calc(buffer, 4);
     tx_raw(buffer, sizeof(buffer));
@@ -292,7 +292,7 @@ void ir_rx_loop(void)
         }
         if (valid && app_pairing_cb) {
             ir_pairing_packet_t pkt = {
-                .nonce     = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8),
+                .addr_lsbs = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8),
                 .player_id = buf[3],
             };
             app_pairing_cb(&pkt);

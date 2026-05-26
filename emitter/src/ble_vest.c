@@ -354,14 +354,6 @@ int ble_vest_send_friendly_fire(uint8_t enabled)
     return vest_write(buf, 2);
 }
 
-int ble_vest_send_pair_confirm(uint16_t nonce)
-{
-    uint8_t buf[3];
-    buf[0] = VEST_CMD_PAIR_CONFIRM;
-    sys_put_le16(nonce, &buf[1]);
-    return vest_write(buf, 3);
-}
-
 int ble_vest_send_unpair(void)
 {
     uint8_t buf[1] = { VEST_CMD_UNPAIR };
