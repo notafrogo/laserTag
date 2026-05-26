@@ -1,7 +1,6 @@
 / {
     aliases {
         irsensor = &ir_rx_pin;
-        unpair-button = &unpair_button;
     };
 
     gpio_inputs {
@@ -11,9 +10,17 @@
             gpios = <&gpio0 29 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
             label = "VS1838B IR Receiver";
         };
-        unpair_button: unpair_button {
-            gpios = <&gpio0 13 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
-            label = "Unpair Button";
-        };
     };
+};
+
+/* Pro Micro nRF52840: its board file has pwm0 enabled and bound to P0.15
+ * (the onboard red LED) via the red_pwm_led pwm-leds node. Don't let the
+ * board's PWM peripheral keep that pin in play — we drive it as plain GPIO
+ * for the status LED, and a contention between pwm0's pinctrl claim and
+ * our GPIO output on the same pad has been observed pulling the supply
+ * rail down gradually. Disabling pwm0 here is harmless on the receiver
+ * (we don't transmit IR here) and releases P0.15 to be pure GPIO.
+ */
+&pwm0 {
+    status = "disabled";
 };
