@@ -329,6 +329,16 @@ static void pairing_tx_work_handler(struct k_work *work)
     if (gpio_pin_get_dt(&trigger) != 1) {
         return;
     }
+    /* Once the BLE link to the vest is up, stop firing. Continuing to
+     * blast IR from this cooperative workqueue while GATT discovery and
+     * the pair-confirm write are in flight starves the system workqueue
+     * and BT host, and the vest never receives VEST_CMD_PAIR_CONFIRM
+     * before its 5s timeout. The user is free to keep holding the
+     * trigger — we just don't need IR anymore once we have a link.
+     */
+    if (ble_vest_link_up()) {
+        return;
+    }
 
     ir_pairing_packet_t pkt = {
         .nonce     = current_pairing_nonce,

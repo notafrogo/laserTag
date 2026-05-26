@@ -373,6 +373,11 @@ bool ble_vest_is_connected(void)
     return vest_conn != NULL && cmd_rx_handle != 0;
 }
 
+bool ble_vest_link_up(void)
+{
+    return vest_conn != NULL;
+}
+
 void ble_vest_disconnect(void)
 {
     if (vest_conn) {

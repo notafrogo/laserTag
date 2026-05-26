@@ -37,6 +37,13 @@ int ble_vest_send_pair_confirm(uint16_t nonce);
 int ble_vest_send_unpair(void);
 
 bool ble_vest_is_connected(void);
+/* True as soon as the BLE link to the vest is established, even before
+ * GATT discovery completes. Used by the pairing-IR transmitter to stop
+ * firing once we have a connection — continuing to fire from the
+ * cooperative IR workqueue starves the system workqueue / BT host
+ * thread and prevents PAIR_CONFIRM from going out.
+ */
+bool ble_vest_link_up(void);
 void ble_vest_disconnect(void);
 
 /* If a vest is currently connected at BLE level, copy its 6-byte MAC into
