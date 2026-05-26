@@ -674,11 +674,8 @@ static void scan_recv(const struct bt_le_scan_recv_info *info, struct net_buf_si
         return;
     }
 
-    /* Diagnostic: log every adv we receive (rate-limited) so we can tell
-     * which PHYs and which devices are reaching the scanner. primary_phy
-     * is 0x01 for 1M, 0x03 for Coded — if we never see 0x01 here, the
-     * Coded-only scanner theory is correct and the vest's 1M ads aren't
-     * making it through.
+    /* Diagnostic: log every 32nd adv (rate-limited). primary_phy is 0x01
+     * for 1M, 0x03 for Coded — useful for bring-up.
      */
     static uint32_t adv_log_count;
     if ((adv_log_count++ & 0x1F) == 0) {
@@ -693,9 +690,35 @@ static void scan_recv(const struct bt_le_scan_recv_info *info, struct net_buf_si
         ble_vest_on_scan_result(info->addr, info->rssi, buf);
     }
 
-    /* Mesh messages */
-    if (phone_conn) {
-        mesh_process_received(buf->data, buf->len, info->rssi);
+    /* Mesh ingest is restricted to Coded PHY — our mesh broadcasts go out
+     * on Coded only, and the 1M band is dominated by unrelated iBeacons
+     * and OS-level adverts. If we let 1M traffic through, every nearby
+     * Apple device's adv gets misparsed as a mesh packet, dedup-cached,
+     * and forwarded to the phone over GATT — saturating the BT host's
+     * notify queue and blocking GATT writes like VEST_CMD_PAIR_CONFIRM
+     * from going out to the vest.
+     *
+     * Also: buf->data is the full BLE AD-record blob, not the raw mesh
+     * payload. We need to walk records and pull out the
+     * BT_DATA_MANUFACTURER_DATA contents (where mesh.c puts our header
+     * via BT_DATA(BT_DATA_MANUFACTURER_DATA, ...)).
+     */
+    if (phone_conn && info->primary_phy == BT_GAP_LE_PHY_CODED) {
+        const uint8_t *d = buf->data;
+        uint16_t pos = 0;
+        while (pos + 1 < buf->len) {
+            uint8_t ad_len = d[pos];
+            if (ad_len == 0 || pos + 1 + ad_len > buf->len) {
+                break;
+            }
+            uint8_t ad_type = d[pos + 1];
+            if (ad_type == BT_DATA_MANUFACTURER_DATA && ad_len >= 1) {
+                uint16_t payload_len = ad_len - 1;
+                mesh_process_received(&d[pos + 2], payload_len, info->rssi);
+                break;
+            }
+            pos += ad_len + 1;
+        }
     }
 }
 
