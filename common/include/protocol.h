@@ -38,6 +38,7 @@
 #define RSP_VEST_PAIRED         0x98  /* payload: vest MAC[6] */
 #define RSP_RESPAWN_ACK         0x99
 #define RSP_VEST_DISCONNECTED   0x9A  /* payload: BT HCI reason (1 byte) */
+#define RSP_LOG                 0x9B  /* payload: severity (1 byte) + UTF-8 text */
 #define RSP_STATE_UPDATE        0xA0
 #define RSP_DEATH_NOTIFY        0xA1
 

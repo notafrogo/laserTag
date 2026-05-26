@@ -1,7 +1,11 @@
 #include "ble_phone.h"
+#include "protocol.h"
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/logging/log.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
 
 LOG_MODULE_REGISTER(ble_phone, LOG_LEVEL_INF);
 
@@ -15,6 +19,13 @@ LOG_MODULE_REGISTER(ble_phone, LOG_LEVEL_INF);
 #define BT_UUID_EMITTER_TX  BT_UUID_DECLARE_128(BT_UUID_EMITTER_TX_VAL)
 
 static ble_phone_rx_cb_t app_rx_cb;
+
+/* Tracked separately from the caller's `phone_conn` so the logging path
+ * doesn't have to thread a connection pointer through every module.
+ * Set/cleared by main.c via ble_phone_log_set_conn in the BLE
+ * connected/disconnected callbacks.
+ */
+static struct bt_conn *log_conn;
 
 static ssize_t on_rx_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                            const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
@@ -52,4 +63,45 @@ void ble_phone_notify(struct bt_conn *conn, const uint8_t *data, uint16_t len)
     if (err) {
         LOG_WRN("Phone notify failed (err %d)", err);
     }
+}
+
+void ble_phone_log_set_conn(struct bt_conn *conn)
+{
+    log_conn = conn;
+}
+
+void ble_phone_log(uint8_t severity, const char *fmt, ...)
+{
+    if (!log_conn) {
+        return;
+    }
+
+    /* notify_buf layout: [opcode][severity][text...] — text is NOT
+     * NUL-terminated; the receiver uses the BLE notify length to know
+     * where it ends. 150 bytes of text fits comfortably inside iOS's
+     * typical negotiated ATT MTU (~185 bytes), with 2 bytes of header.
+     */
+    uint8_t notify_buf[152];
+    notify_buf[0] = RSP_LOG;
+    notify_buf[1] = severity;
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf((char *)&notify_buf[2], sizeof(notify_buf) - 2, fmt, ap);
+    va_end(ap);
+
+    if (n < 0) {
+        return;
+    }
+    size_t text_len = (size_t)n;
+    if (text_len > sizeof(notify_buf) - 2) {
+        text_len = sizeof(notify_buf) - 2;  /* vsnprintf truncated */
+    }
+
+    /* bt_gatt_notify is non-blocking and returns -ENOMEM if the host's
+     * TX queue is full; we drop the log line in that case rather than
+     * blocking the caller (which may be on the BT host thread itself).
+     */
+    (void)bt_gatt_notify(log_conn, &emitter_phone_svc.attrs[2],
+                         notify_buf, 2 + text_len);
 }

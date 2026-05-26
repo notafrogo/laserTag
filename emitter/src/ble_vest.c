@@ -1,4 +1,5 @@
 #include "ble_vest.h"
+#include "ble_phone.h"
 #include "protocol.h"
 #include "mesh.h"
 #include <zephyr/kernel.h>
@@ -106,7 +107,7 @@ static uint8_t gatt_discover_cb(struct bt_conn *conn,
 {
     if (!attr) {
         if (disc_stage == DISC_SERVICE) {
-            LOG_ERR("Vest service not found");
+            PLOG_ERR("Vest service not found");
         }
         return BT_GATT_ITER_STOP;
     }
@@ -116,7 +117,7 @@ static uint8_t gatt_discover_cb(struct bt_conn *conn,
         struct bt_gatt_service_val *svc = attr->user_data;
         svc_start_handle = attr->handle + 1;
         svc_end_handle = svc->end_handle;
-        LOG_INF("Vest service found: handles %d-%d", svc_start_handle, svc_end_handle);
+        PLOG_INF("Vest service found: handles %d-%d", svc_start_handle, svc_end_handle);
 
         disc_stage = DISC_CHAR;
         discover_params.uuid = NULL;
@@ -135,10 +136,10 @@ static uint8_t gatt_discover_cb(struct bt_conn *conn,
         struct bt_gatt_chrc *chrc = attr->user_data;
         if (!bt_uuid_cmp(chrc->uuid, &vest_hit_tx_uuid.uuid)) {
             hit_tx_value_handle = chrc->value_handle;
-            LOG_INF("Hit TX char found: handle %d", hit_tx_value_handle);
+            PLOG_INF("Hit TX char found: handle %d", hit_tx_value_handle);
         } else if (!bt_uuid_cmp(chrc->uuid, &vest_cmd_rx_uuid.uuid)) {
             cmd_rx_handle = chrc->value_handle;
-            LOG_INF("Cmd RX char found: handle %d", cmd_rx_handle);
+            PLOG_INF("Cmd RX char found: handle %d", cmd_rx_handle);
         }
 
         if (hit_tx_value_handle && cmd_rx_handle) {
@@ -152,9 +153,9 @@ static uint8_t gatt_discover_cb(struct bt_conn *conn,
 
             int err = bt_gatt_subscribe(conn, &subscribe_params);
             if (err && err != -EALREADY) {
-                LOG_ERR("Subscribe failed (err %d)", err);
+                PLOG_ERR("Subscribe failed (err %d)", err);
             } else {
-                LOG_INF("Subscribed to vest Hit TX");
+                PLOG_INF("Subscribed to vest Hit TX");
                 disc_stage = DISC_DONE;
                 k_work_submit(&ready_cb_work);
             }
@@ -179,7 +180,7 @@ static void vest_conn_connected(struct bt_conn *conn, uint8_t err)
     }
 
     if (err) {
-        LOG_ERR("Vest connection failed (err %d)", err);
+        PLOG_ERR("Vest connection failed (err %d)", err);
         bt_conn_unref(vest_conn);
         vest_conn = NULL;
         mesh_start_scanner();
@@ -193,7 +194,7 @@ static void vest_conn_connected(struct bt_conn *conn, uint8_t err)
 
     char addr_str[BT_ADDR_LE_STR_LEN];
     bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
-    LOG_INF("Vest connected: %s", addr_str);
+    PLOG_INF("Vest connected: %s", addr_str);
 
     memcpy(vest_mac, addr->a.val, 6);
     has_vest_mac = true;

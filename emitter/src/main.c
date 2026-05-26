@@ -294,12 +294,12 @@ static void on_vest_connected(const uint8_t *mac)
      * kept in ble_vest's state and pulled later via ble_vest_get_active_mac.
      */
     (void)mac;
-    LOG_INF("Vest BLE connected, awaiting GATT");
+    PLOG_INF("Vest BLE connected, awaiting GATT");
 }
 
 static void on_vest_disconnected(uint8_t reason)
 {
-    LOG_WRN("Vest disconnected (reason %u)", reason);
+    PLOG_WRN("Vest disconnected (reason %u)", reason);
     if (phone_conn) {
         uint8_t buf[2] = { RSP_VEST_DISCONNECTED, reason };
         phone_notify(buf, 2);
@@ -367,7 +367,9 @@ static void on_vest_gatt_ready(void)
         buf[0] = RSP_VEST_PAIRED;
         memcpy(&buf[1], vmac, 6);
         phone_notify(buf, 7);
-        LOG_INF("Vest paired, notified phone");
+        PLOG_INF("Vest paired, notified phone");
+    } else {
+        PLOG_WRN("GATT ready but no active vest MAC — not sending RSP_VEST_PAIRED");
     }
 }
 
@@ -618,7 +620,7 @@ static void on_phone_rx(const uint8_t *data, uint16_t len)
     case CMD_ENTER_PAIRING:
         current_state = EMITTER_PAIRING;
         phone_ack(RSP_PAIRING_ACK);
-        LOG_INF("Pairing mode: shoot the vest (addr_lsbs=0x%04x)", emitter_addr_lsbs);
+        PLOG_INF("Pairing mode: shoot the vest (addr_lsbs=0x%04x)", emitter_addr_lsbs);
         break;
 
     case CMD_UNPAIR_VEST:
@@ -763,6 +765,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
     phone_conn = bt_conn_ref(conn);
     mesh_set_phone_conn(phone_conn);
+    ble_phone_log_set_conn(phone_conn);
     gpio_pin_set_dt(&status_led, 1);
 
     /* If a vest is already paired to us, the phone never saw the original
@@ -775,7 +778,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
         buf[0] = RSP_VEST_PAIRED;
         memcpy(&buf[1], vmac, 6);
         phone_notify(buf, 7);
-        LOG_INF("Re-notified phone of already-paired vest");
+        PLOG_INF("Re-notified phone of already-paired vest");
     }
 }
 
@@ -786,6 +789,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
         bt_conn_unref(phone_conn);
         phone_conn = NULL;
         mesh_set_phone_conn(NULL);
+        ble_phone_log_set_conn(NULL);
         gpio_pin_set_dt(&status_led, 0);
         k_work_reschedule(&adv_work, K_MSEC(100));
     }
