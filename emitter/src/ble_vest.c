@@ -117,7 +117,7 @@ static uint8_t gatt_discover_cb(struct bt_conn *conn,
         struct bt_gatt_service_val *svc = attr->user_data;
         svc_start_handle = attr->handle + 1;
         svc_end_handle = svc->end_handle;
-        PLOG_INF("Vest service found: handles %d-%d", svc_start_handle, svc_end_handle);
+        LOG_INF("Vest service found: handles %d-%d", svc_start_handle, svc_end_handle);
 
         disc_stage = DISC_CHAR;
         discover_params.uuid = NULL;
@@ -136,10 +136,10 @@ static uint8_t gatt_discover_cb(struct bt_conn *conn,
         struct bt_gatt_chrc *chrc = attr->user_data;
         if (!bt_uuid_cmp(chrc->uuid, &vest_hit_tx_uuid.uuid)) {
             hit_tx_value_handle = chrc->value_handle;
-            PLOG_INF("Hit TX char found: handle %d", hit_tx_value_handle);
+            LOG_INF("Hit TX char found: handle %d", hit_tx_value_handle);
         } else if (!bt_uuid_cmp(chrc->uuid, &vest_cmd_rx_uuid.uuid)) {
             cmd_rx_handle = chrc->value_handle;
-            PLOG_INF("Cmd RX char found: handle %d", cmd_rx_handle);
+            LOG_INF("Cmd RX char found: handle %d", cmd_rx_handle);
         }
 
         if (hit_tx_value_handle && cmd_rx_handle) {
@@ -194,7 +194,7 @@ static void vest_conn_connected(struct bt_conn *conn, uint8_t err)
 
     char addr_str[BT_ADDR_LE_STR_LEN];
     bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
-    PLOG_INF("Vest connected: %s", addr_str);
+    LOG_INF("Vest connected: %s", addr_str);
 
     memcpy(vest_mac, addr->a.val, 6);
     has_vest_mac = true;

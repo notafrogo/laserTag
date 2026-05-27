@@ -294,7 +294,7 @@ static void on_vest_connected(const uint8_t *mac)
      * kept in ble_vest's state and pulled later via ble_vest_get_active_mac.
      */
     (void)mac;
-    PLOG_INF("Vest BLE connected, awaiting GATT");
+    LOG_INF("Vest BLE connected, awaiting GATT");
 }
 
 static void on_vest_disconnected(uint8_t reason)
