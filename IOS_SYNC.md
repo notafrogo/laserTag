@@ -64,7 +64,46 @@ access to both repos so it can look things up.
 
 ## Pending
 
-*(none right now — add new entries here)*
+### PENDING Vest-disconnect banner: not tappable, overlaps other UI
+
+**Firmware:** n/a — iOS-only fix. (Banner exists because of the
+`RSP_VEST_DISCONNECTED` opcode added in firmware `8647ccf` / iOS
+`bb9f1da`; the bug is in the banner's view layer, not the protocol.)
+**Why:** User-reported UX bug. The header that appears at the top of
+the screen saying "vest disconnected" is currently rendered as a
+visual element only — tapping it does nothing — and it sits on top of
+other UI elements behind it instead of being inset into the layout.
+
+**iOS changes:**
+- File: `laserTag/Flow/VestDisconnectBanner.swift`
+  - Make the banner tappable. Suggested tap action: dismiss the
+    banner and route the user back to the pairing flow
+    (`flow.advance(to: .pairing)` or equivalent — confirm the right
+    enum case by looking at `AppFlow.swift`). If a different tap
+    target makes more sense in context, pick the simplest one that
+    gives the user something to do, not a dead pixel.
+  - Fix the layout so the banner doesn't overlap controls behind it.
+    Likely needs to be inserted via `.safeAreaInset(edge: .top)` on
+    the host view, or rendered as a proper top-pinned overlay that
+    pushes the underlying content down — not a free-floating ZStack
+    layer that occludes whatever is at the top of the screen.
+- Audit every view that hosts the banner (`LobbyView`, `GameHUDView`,
+  `SetupView`, etc.) — whichever views show it, apply the
+  non-overlapping placement consistently.
+
+**Notes / gotchas:**
+- The banner is driven by `BLEManager.vestPaired` flipping false
+  while `connectionState == .ready` (emitter still connected, vest
+  dropped). Don't change that trigger — only the rendering/tap
+  behaviour.
+- Don't suppress the banner on `connectionState == .disconnected`
+  paths; those have their own "back to pairing" flow and the banner
+  wouldn't be shown there anyway since `vestPaired` would already be
+  false from the pre-disconnect state.
+- If the tap-behaviour intent is genuinely ambiguous after reading
+  `AppFlow.swift` and `VestDisconnectBanner.swift` together — stop
+  and ask; don't guess and ship a tap target that does the wrong
+  thing.
 
 ---
 
