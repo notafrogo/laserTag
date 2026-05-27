@@ -315,26 +315,7 @@ static void ir_tx_work_handler(struct k_work *work)
         .weapon_id = 0x00,
         .team_id   = local_player.team_id,
     };
-
-    /* Send the hit frame 3 times with a 50 ms gap. The IR RX decoder
-     * has a non-zero per-frame failure rate (timing tolerances are
-     * tight on the Pro Micro). Pairing works because it's naturally
-     * repeated while the trigger is held; a single trigger pull has to
-     * land as a single hit, so we burst here to give the receiver
-     * multiple chances. The vest's hit_pending flag dedups — once any
-     * frame in the burst decodes and the vest notifies the emitter,
-     * subsequent frames are silently dropped on the vest side, so this
-     * doesn't double-count.
-     *
-     * 50 ms gap is well above the receiver's 10 ms end-of-frame
-     * silence threshold so the frames are seen as independent.
-     */
-    for (int i = 0; i < 3; i++) {
-        ir_tx_send(&pkt);
-        if (i < 2) {
-            k_msleep(50);
-        }
-    }
+    ir_tx_send(&pkt);
 }
 
 /* Fires one pairing IR frame, then reschedules itself while the trigger
