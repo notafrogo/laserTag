@@ -384,7 +384,16 @@ static void on_vest_gatt_ready(void)
 
 static void trigger_work_handler(struct k_work *work)
 {
+    int raw = gpio_pin_get_raw(trigger.port, trigger.pin);
     bool pressed = (gpio_pin_get_dt(&trigger) == 1);
+
+    /* Diagnostic: prints raw physical pin level (0/1, polarity-agnostic)
+     * and the logical "pressed" reading after polarity flag is applied.
+     * Lets us figure out the right ACTIVE_HIGH/LOW + PULL_UP/DOWN combo
+     * from observed behavior rather than guessing. Remove once trigger
+     * config is dialed in.
+     */
+    PLOG_INF("trigger: raw=%d pressed=%d", raw, pressed);
 
     if (!pressed) {
         trigger_ready = true;
