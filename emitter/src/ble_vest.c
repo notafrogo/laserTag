@@ -203,7 +203,13 @@ static void vest_conn_connected(struct bt_conn *conn, uint8_t err)
     hit_tx_value_handle = 0;
     start_gatt_discovery(conn);
 
-    mesh_start_scanner();
+    /* Deliberately do NOT restart the mesh scanner here. Scanning during
+     * GATT discovery time-slices the radio against both the new vest
+     * connection's traffic and the existing phone connection — on a
+     * Pro Micro that's enough to make supervision packets to the phone
+     * slip and iOS drops the link mid-pairing. The scanner gets
+     * restarted from on_vest_gatt_ready once discovery has completed.
+     */
 
     if (connected_cb) {
         connected_cb(vest_mac);

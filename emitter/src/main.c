@@ -371,6 +371,13 @@ static void on_vest_gatt_ready(void)
     } else {
         PLOG_WRN("GATT ready but no active vest MAC — not sending RSP_VEST_PAIRED");
     }
+
+    /* GATT discovery is done — safe to restart the mesh scanner now that
+     * the most radio-intense part of pairing has settled. The scanner
+     * was paused in vest_conn_connected to avoid time-slicing the radio
+     * against two active connections during the GATT-discovery window.
+     */
+    mesh_start_scanner();
 }
 
 /* ===== Trigger Handling ===== */
