@@ -436,7 +436,15 @@ static void trigger_work_handler(struct k_work *work)
 static void trigger_pressed_cb(const struct device *dev, struct gpio_callback *cb,
                                 uint32_t pins)
 {
-    k_work_reschedule(&trigger_work, K_NO_WAIT);
+    /* Debounce: schedule the work with a small delay rather than running
+     * immediately. Subsequent edges within the window just re-schedule
+     * (k_work_reschedule cancels the pending one and replaces it),
+     * so the handler runs exactly once per stable transition after the
+     * bouncing has settled. The 20 ms window is well above typical
+     * tactile-switch bounce duration but well below the fire_rate_ms
+     * (100 ms) gate, so it doesn't visibly slow the trigger response.
+     */
+    k_work_reschedule(&trigger_work, K_MSEC(20));
 }
 
 /* ===== Reload ===== */
