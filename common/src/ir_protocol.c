@@ -63,6 +63,17 @@ static void tx_raw(const uint8_t *bytes, size_t len)
             k_msleep(bit ? 3 : 1);
         }
     }
+    /* Trailing stop-bit mark — carries no data, exists only so the
+     * receiver gets one more SPACE→MARK transition to measure the last
+     * data bit's space. Without this, the decoder counts N-1 bits for
+     * N transmitted bits and the multiple-of-8 check in ir_rx_loop
+     * discards the frame. (Pairing previously "worked" because the
+     * TSOP's AGC recovery happened to drop a phantom edge in the right
+     * window on some attempts; hits failed deterministically because
+     * they're single-shot, no retry.)
+     */
+    pwm_set(tx_pwm, 0, period, pulse, 0);
+    k_msleep(1);
     pwm_set(tx_pwm, 0, period, 0, 0);
 }
 
