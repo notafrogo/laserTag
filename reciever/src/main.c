@@ -395,16 +395,16 @@ static void connected(struct bt_conn *conn, uint8_t err)
             return;
         }
 
-        /* MAC matches — commit the binding. */
+        /* MAC matches — commit the binding (in RAM only; pairing is
+         * ephemeral and gets cleared at the next power-on).
+         */
         bt_addr_le_copy(&paired_emitter_addr, peer);
         has_paired_addr = true;
         pair_pending = false;
         current_state = VEST_PAIRED_IDLE;
-        settings_save_one("vest/emitter_addr",
-                          &paired_emitter_addr, sizeof(paired_emitter_addr));
         k_work_cancel_delayable(&pair_pending_timeout_work);
         emitter_conn = bt_conn_ref(conn);
-        LOG_INF("Paired via IR-supplied MAC, committed to NVS: %s (emitter pid=%d)",
+        LOG_INF("Paired via IR-supplied MAC: %s (emitter pid=%d)",
                 addr_str, pending_emitter_player_id);
         return;
     }
@@ -573,10 +573,19 @@ int main(void)
     /* Pair-pending timeout (reverts to UNPAIRED if no matching emitter connects) */
     k_work_init_delayable(&pair_pending_timeout_work, pair_pending_timeout_handler);
 
-    /* NVS settings */
+    /* NVS settings.
+     *
+     * Ephemeral pairing: we deliberately do NOT call settings_load() and
+     * we wipe any persisted vest/emitter_addr entry at boot. Reasoning:
+     * the Pro Micro is flashed via UF2 (drag-and-drop bootloader), which
+     * can't erase NVS along with the app region. If a stale pairing got
+     * stuck in NVS, there'd be no way to clear it short of an SWD
+     * --erase. So pairing is now fresh on every power-on — re-pair by
+     * shooting the TSOP, which takes a second anyway.
+     */
     settings_subsys_init();
     settings_register(&settings_h);
-    settings_load();
+    settings_delete("vest/emitter_addr");
 
     /* Vest BLE service */
     vest_ble_init(on_emitter_cmd);
