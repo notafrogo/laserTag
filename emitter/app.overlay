@@ -7,14 +7,24 @@
     gpio_keys {
         compatible = "gpio-keys";
         trigger_button: trigger_button {
-            /* Trigger switch is on P0.29, wired between pin and VCC.
-             * Internal pull-down holds pin LOW at idle; pressing the
-             * button shorts the pin to VCC = HIGH = "active" per
-             * GPIO_ACTIVE_HIGH. This matches the original wiring;
-             * earlier attempts to switch to PULL_UP / ACTIVE_LOW
-             * assumed button-to-GND which this hardware isn't.
+            /* Trigger switch is on P0.29, normally-closed, wired between
+             * pin and GND. With the NC closed at idle, the switch shorts
+             * the pin to GND (overrides the internal pull-up). Pressing
+             * the trigger opens the NC contact, the pull-up takes the
+             * pin HIGH, which reads as "active" per GPIO_ACTIVE_HIGH.
+             *
+             * Symptom that pinpointed this wiring: with ACTIVE_HIGH +
+             * PULL_DOWN, no fires happen because pressing doesn't pull
+             * the pin HIGH (NC opens, but pull-down still wins). With
+             * ACTIVE_LOW + PULL_UP, fires happen at idle because the
+             * NC short reads as "active". The combo here is the only
+             * one that lines up.
+             *
+             * The 20 ms ISR debounce in trigger_pressed_cb handles the
+             * release-bounce that previously caused double-fires under
+             * this same polarity + pull combo.
              */
-            gpios = <&gpio0 29 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+            gpios = <&gpio0 29 (GPIO_ACTIVE_HIGH | GPIO_PULL_UP)>;
             label = "Trigger Button";
         };
     };
