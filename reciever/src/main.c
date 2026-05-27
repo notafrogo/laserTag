@@ -85,13 +85,35 @@ static void start_pairing_scan(void);
 static void led_timer_handler(struct k_timer *timer_id)
 {
     led_tick++;
+    /* LED patterns (timer fires every 100ms, so led_tick is 0.1s units):
+     *   UNPAIRED, no IR yet     - brief flash every 500ms (1 of 5 ticks)
+     *   UNPAIRED, pair_pending  - rapid blink every 200ms (alternating)
+     *   PAIRED_IDLE, no link    - heartbeat: two quick flashes per second
+     *   PAIRED_IDLE, linked     - solid
+     *   GAME_ACTIVE             - solid
+     *   DEAD                    - fast alternate every tick
+     */
     switch (current_state) {
     case VEST_UNPAIRED:
-        gpio_pin_set_dt(&status_led, (led_tick % 5 == 0) ? 1 : 0);
+        if (pair_pending) {
+            gpio_pin_set_dt(&status_led, (led_tick % 2 == 0) ? 1 : 0);
+        } else {
+            gpio_pin_set_dt(&status_led, (led_tick % 5 == 0) ? 1 : 0);
+        }
         break;
-    case VEST_PAIRED_IDLE:
-        gpio_pin_set_dt(&status_led, 1);
+    case VEST_PAIRED_IDLE: {
+        bool linked = (emitter_conn != NULL);
+        if (linked) {
+            gpio_pin_set_dt(&status_led, 1);
+        } else {
+            /* Heartbeat: ON for ticks 0 and 2 in every 10-tick window,
+             * OFF otherwise. Looks like two short blinks each second.
+             */
+            uint8_t phase = led_tick % 10;
+            gpio_pin_set_dt(&status_led, (phase == 0 || phase == 2) ? 1 : 0);
+        }
         break;
+    }
     case VEST_GAME_ACTIVE:
         gpio_pin_set_dt(&status_led, 1);
         break;
