@@ -253,6 +253,15 @@ void ir_rx_loop(void)
                 decoded_len = cur_bits / 8;
                 memcpy((void *)decoded_bytes, (const void *)rx_bytes, decoded_len);
                 data_ready = true;
+            } else if (cur_bits > 0) {
+                /* Frame ended with a bit count that isn't a clean
+                 * multiple of 8 — usually means one bit's mark or
+                 * space landed outside the timing windows and the
+                 * state machine reset, costing the partial frame.
+                 * Log it so we can see if individual hit frames are
+                 * dropping vs decoding.
+                 */
+                LOG_WRN("IR frame discarded: cur_bits=%u (not multiple of 8)", cur_bits);
             }
             rx_reset();
         }
