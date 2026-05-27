@@ -64,42 +64,26 @@ access to both repos so it can look things up.
 
 ## Pending
 
-### PENDING Training mode: bump mag size so it doesn't empty mid-session
-
-**Firmware:** n/a — iOS-only config tweak.
-**Why:** With the current `TrainingSession` config (`magSize = 30`,
-`initialTotalAmmo = 9999`), the user runs out of mag ammo after 30
-shots and the trigger silently stops firing (firmware bails out of
-`trigger_work_handler` when `mag_ammo == 0`). Reported in target
-practice: the emitter "stops shooting after 29 shots." The training
-view never sends `CMD_RELOAD`, so it just dead-ends.
-
-**iOS changes:**
-- `TrainingSession.swift`
-  - In the `EmitterConfig` built for training, set `magSize` and
-    `initialTotalAmmo` both to **9999** so the starting mag fills
-    completely and there's no reserve to draw down. Game-state init
-    in the firmware (`game_state_start_game`) sets
-    `starting_mag = min(initial_total_ammo, mag_size)`, so matching
-    them at 9999 means the mag holds the whole budget and never
-    empties in a realistic session.
-  - Keep `damage = 1`, `maxHealth = 255`, `fireRateMs = 100`,
-    `reloadSpeedMs = 500`, `fullAuto = false` as before.
-
-**Notes / gotchas:**
-- Don't go higher than 65535 — `mag_size` is `uint16_t` in the
-  packed config struct.
-- If we ever want to add an authentic-feel "reload" option, it
-  belongs as a session-level toggle in the training UI ("Realistic
-  reloads: on/off"), not by silently lowering the mag again. For now
-  the unlimited-mag default keeps the practice loop uninterrupted.
-- No other game-mode code paths use `TrainingSession`, so this only
-  affects training views — multiplayer game config still comes from
-  the host-lobby flow's separate `EmitterConfig`.
+_(none)_
 
 ---
 
 ## Applied
+
+### Firmware `81eb927` (iOS-only) → iOS `42c52ea`: Training mode mag-size bump
+
+**Why:** With the previous `TrainingSession` config (`magSize = 30`,
+`initialTotalAmmo = 9999`), the user ran out of mag ammo after 30
+shots and the trigger silently stopped firing (firmware bails out of
+`trigger_work_handler` when `mag_ammo == 0`). The training view
+never sends `CMD_RELOAD`, so it just dead-ended.
+
+**iOS changes applied:**
+- `TrainingSession.swift`
+  - Set `magSize = 9999` in the training `EmitterConfig` (matches
+    `initialTotalAmmo`). `game_state_start_game` sets
+    `starting_mag = min(initial_total_ammo, mag_size)`, so the
+    starting mag now holds the whole budget. Other fields unchanged.
 
 ### Firmware `1ed47b6`, `ccdbdcd` (iOS-only) → iOS `b792f21`: Training mode — Target Practice + Reaction Time
 
