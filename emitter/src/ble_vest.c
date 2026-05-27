@@ -77,8 +77,8 @@ static uint8_t hit_notify_cb(struct bt_conn *conn,
     uint8_t weapon_id  = d[3];
     uint8_t team_id    = d[4];
 
-    LOG_INF("Vest hit: pkt=0x%04x shooter=%d weapon=%d team=%d",
-            packet_id, shooter_id, weapon_id, team_id);
+    PLOG_INF("Vest hit RX: pkt=0x%04x shooter=%d weapon=%d team=%d",
+             packet_id, shooter_id, weapon_id, team_id);
 
     if (hit_cb) {
         hit_cb(packet_id, shooter_id, weapon_id, team_id);
