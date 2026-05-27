@@ -64,7 +64,136 @@ access to both repos so it can look things up.
 
 ## Pending
 
-_(none)_
+### PENDING Target Practice mode — single-player, shoot your own vest
+
+**Firmware:** n/a — iOS-only feature. The firmware primitives that already
+exist (`CMD_CONFIG` with `friendly_fire=1`, `CMD_START`, `RSP_STATE_UPDATE`,
+`CMD_RESPAWN`) cover everything; no new opcodes.
+**Why:** Lets a single user with only their own emitter + vest practice
+aiming. They physically shoot their own vest's TSOP, the vest accepts
+the hit (because friendly-fire is on), the emitter reduces health, and
+the app surfaces the hit with an animation + score.
+
+**iOS changes:**
+
+- `LobbyView.swift`
+  - Add a third primary action button **Target Practice**, next to
+    Create Game / Join Game. Same visual weight as the others.
+  - Tapping it pushes / presents a new `TargetPracticeSetupView` (or
+    goes straight into `TargetPracticeView` if no setup is needed —
+    routine's call, see below).
+
+- `TargetPracticeView.swift` (new)
+  - Single-player game screen. No mesh, no map, no teammates.
+  - On appear:
+    1. Build a target-practice `EmitterConfig`:
+       - `friendlyFire = true` (REQUIRED — without this the vest drops
+         own-player hits)
+       - `maxHealth = 255` (so the user doesn't die quickly; OR
+         lower + auto-`sendRespawn()` on `onDeathNotification`)
+       - `damage = 10`
+       - `magSize = 30`, `reloadSpeedMs = 500`, `fireRateMs = 100`
+       - `initialTotalAmmo = 9999` (effectively unlimited)
+       - `fullAuto = false` (semi-auto feels better for practice;
+         user can toggle in a small inline option if desired)
+    2. `bleManager.sendConfig(config)` → wait for `configAck`
+    3. `bleManager.startGame()` → wait for `startAck`. Emitter will
+       automatically push `VEST_CMD_FRIENDLY_LIST` (empty) and
+       `VEST_CMD_FRIENDLY_FIRE(1)` to the vest as part of its
+       `CMD_START` handler, putting the vest in `VEST_GAME_ACTIVE`.
+  - HUD elements:
+    - Big score counter (hits)
+    - Shots fired (track locally by watching `emitterState.magAmmo`
+      decrement — each decrement = one shot)
+    - Accuracy: `hits / shots` as a percentage
+    - Current streak (consecutive hits without intervening shots that
+      didn't hit — see "Notes" below on how to detect a hit)
+    - Best streak
+    - Current health (from `emitterState.health`) — small indicator
+      so the user knows when they're about to need a respawn
+  - Hit animation: when a hit is detected, trigger an attention-grabbing
+    visual — flash overlay, expanding ring at center, hit-marker like
+    a competitive shooter, +1 score popup that floats up and fades.
+    Use SwiftUI animations + a brief haptic
+    (`UIImpactFeedbackGenerator(style: .heavy).impactOccurred()`).
+  - Sound: optional — if added, use AVFoundation with a short
+    "hit" sound effect bundled in `Assets.xcassets` or a small
+    sound file resource. Mute toggle in the top bar.
+  - Controls:
+    - "Reset" — re-sends the same config + `startGame()` (or
+      `sendRespawn()` if game is still running) to reset health/ammo
+      and zero the local score.
+    - "Exit" — calls `bleManager.endGame()` (CMD_GAME_OVER 0x04) and
+      pops back to `LobbyView`.
+
+- `BLEManager.swift`
+  - No new opcode handling needed; reuse the existing dispatch.
+  - May need to expose a hit-detection signal that
+    `TargetPracticeView` can observe. Suggested: new closure
+    property `onHitDetected: ((UInt8 newHealth, UInt8 damage) -> Void)?`
+    set inside the switch on `.stateUpdate` when `emitterState.health`
+    just decreased (compare previous health vs new). Set it from
+    `TargetPracticeView.onAppear` and clear in `onDisappear`. Don't
+    just diff in the view — the diff happens inside the dispatch
+    handler so the source of truth stays in `BLEManager`.
+
+- `AppFlow.swift`
+  - If you decide target practice should be a separate top-level
+    phase (`.targetPractice`), add the case and the transitions.
+    Alternative: keep flow at `.lobby` and treat target practice as a
+    full-screen sheet — fewer enum changes, simpler back path. Pick
+    the option that keeps the diff small.
+
+- `GameManager.swift`
+  - **Do not** wire target practice through `GameManager`. That class
+    is for the mesh-driven multiplayer lifecycle (lobby, teams, mesh
+    messages). Target practice is single-device, no mesh, no roster.
+    Keep the practice state local to `TargetPracticeView` (or a small
+    dedicated `@Observable` model owned by the view).
+
+**Notes / gotchas:**
+
+- **Detecting a "hit" cleanly:** the firmware sends
+  `RSP_STATE_UPDATE` (0xA0) for many reasons — firing reduces
+  `magAmmo`, hits reduce `health`, reload changes both magAmmo and
+  reserve. The correct hit signal is **health decreased between
+  consecutive 0xA0 updates**. Cache the previous health in
+  `BLEManager` and compare. Mag-ammo decrements alone are shots, not
+  hits.
+- **Shots fired vs hits:** `magAmmo` decreasing is the most reliable
+  shot indicator. Track in `BLEManager` the same way (cache
+  previous, compute delta on each `.stateUpdate`). The view computes
+  accuracy from those running totals.
+- **Friendly-fire requirement is non-negotiable.** Without
+  `friendly_fire = 1` in the config, the vest will silently drop the
+  user's own hits (the vest does this check, not the emitter). If
+  this is forgotten the whole feature looks broken with no obvious
+  error.
+- **Respawn behaviour:** if you go with normal `maxHealth` (e.g.
+  100) instead of 255, wire `onDeathNotification` in
+  `BLEManager` to auto-call `sendRespawn()` after a short delay
+  (1–2 s — long enough for the user to see a "you died, respawning"
+  animation). Otherwise the gun will just stop firing once dead
+  and the user will think it's broken.
+- **The vest must be paired** before target practice can start. The
+  setup view (or the entry-into-target-practice action) should
+  check `bleManager.vestPaired` and route to the pairing flow if
+  not yet paired. Same precondition as starting a normal game.
+- **No mesh broadcasts.** Make sure target-practice mode doesn't
+  send `CMD_BROADCAST_GAME_CFG` or any lobby/mesh commands. The
+  emitter would happily broadcast and confuse nearby devices.
+  Use only `CMD_CONFIG` + `CMD_START` + (optional)
+  `CMD_RESPAWN` + `CMD_GAME_OVER` + `CMD_RELOAD`.
+- **Visual style:** the existing app leans into a monochrome /
+  utilitarian aesthetic (see DashboardView). The hit animation
+  should match — punchy but not cartoonish. Reference the
+  competitive-shooter hit-marker idiom (brief geometric flash,
+  not a confetti explosion).
+- **If the routine wants to ask anything about visual design,
+  scoring rules, or whether to add sound — stop and ask** before
+  shipping. The exact UX of "cool hit animation" is subjective and
+  worth a quick clarification rather than a wrong-direction
+  rebuild.
 
 ---
 
