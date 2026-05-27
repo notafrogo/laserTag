@@ -78,8 +78,7 @@ void ble_phone_log(uint8_t severity, const char *fmt, ...)
 
     /* notify_buf layout: [opcode][severity][text...] — text is NOT
      * NUL-terminated; the receiver uses the BLE notify length to know
-     * where it ends. 150 bytes of text fits comfortably inside iOS's
-     * typical negotiated ATT MTU (~185 bytes), with 2 bytes of header.
+     * where it ends.
      */
     uint8_t notify_buf[152];
     notify_buf[0] = RSP_LOG;
@@ -97,11 +96,33 @@ void ble_phone_log(uint8_t severity, const char *fmt, ...)
     if (text_len > sizeof(notify_buf) - 2) {
         text_len = sizeof(notify_buf) - 2;  /* vsnprintf truncated */
     }
+    size_t total = 2 + text_len;
+
+    /* Notification payload is bounded by the current ATT MTU minus the
+     * 3-byte ATT_HANDLE_VALUE_NTF header. iOS auto-negotiates ~185 byte
+     * MTU shortly after connect but the exchange takes a moment — if a
+     * log line fires before MTU is up, bt_gatt_notify returns -EMSGSIZE
+     * and the entire line is silently lost. Trim to whatever MTU
+     * actually is right now (worst case 23 → 20 byte payloads).
+     */
+    uint16_t mtu = bt_gatt_get_mtu(log_conn);
+    if (mtu < 5) {
+        return;  /* shouldn't happen — bail rather than write a negative size */
+    }
+    size_t max_payload = (size_t)mtu - 3;
+    if (total > max_payload) {
+        total = max_payload;
+    }
 
     /* bt_gatt_notify is non-blocking and returns -ENOMEM if the host's
      * TX queue is full; we drop the log line in that case rather than
      * blocking the caller (which may be on the BT host thread itself).
+     * Log failures so they're at least visible in RTT when attached.
      */
-    (void)bt_gatt_notify(log_conn, &emitter_phone_svc.attrs[2],
-                         notify_buf, 2 + text_len);
+    int err = bt_gatt_notify(log_conn, &emitter_phone_svc.attrs[2],
+                             notify_buf, total);
+    if (err) {
+        LOG_WRN("RSP_LOG notify failed (err %d, mtu=%u, total=%u)",
+                err, mtu, (unsigned)total);
+    }
 }
