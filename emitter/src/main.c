@@ -682,6 +682,56 @@ static void on_phone_rx(const uint8_t *data, uint16_t len)
             }
         }
         break;
+
+    /* ===== Debug commands =====
+     *
+     * Let a bare second Pro Micro (no trigger, no IR LED, no vest)
+     * participate in IR + mesh testing by simulating the events that
+     * normally come from physical hardware. The bare board still runs
+     * the full BLE + mesh stack — these just synthesise the local
+     * inputs we can't generate without peripherals.
+     *
+     * Strip both cases when the test rig is no longer needed; nothing
+     * else in the firmware depends on them.
+     */
+
+    case CMD_DEBUG_FIRE:
+        /* Mirror the single-shot path of trigger_work_handler. Same
+         * ammo / reload / fire-rate gating, just bypasses the GPIO
+         * read. Mesh isn't broadcast from the fire path — to exercise
+         * MESH_HIT_EVENT / MESH_PLAYER_DEATH, use CMD_DEBUG_HIT.
+         */
+        PLOG_INF("Debug fire");
+        if (current_state != EMITTER_GAME_ACTIVE) {
+            break;
+        }
+        if (game_state_is_reloading()) {
+            break;
+        }
+        if (game_state_get_mag_ammo() == 0) {
+            break;
+        }
+        if (!game_state_try_fire(k_uptime_get())) {
+            break;
+        }
+        send_state_update();
+        k_work_submit_to_queue(&ir_tx_q, &ir_tx_work);
+        break;
+
+    case CMD_DEBUG_HIT:
+        /* Synthesise a vest-hit reception so the bare board broadcasts
+         * MESH_HIT_EVENT (and MESH_PLAYER_DEATH if the synthetic hit
+         * kills it). Optional 1-byte shooter ID payload; defaults to
+         * 0xFF if omitted. packet_id is derived from uptime so the
+         * hit-dedup ring won't drop repeated calls.
+         */
+        {
+            uint8_t shooter_id = (len > 1) ? data[1] : 0xFF;
+            uint16_t fake_packet_id = (uint16_t)k_uptime_get();
+            PLOG_INF("Debug hit from shooter=%u", shooter_id);
+            on_vest_hit(fake_packet_id, shooter_id, 0, 0);
+        }
+        break;
     }
 }
 

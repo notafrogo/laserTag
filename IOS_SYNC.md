@@ -64,7 +64,65 @@ access to both repos so it can look things up.
 
 ## Pending
 
-_(none)_
+### PENDING Debug overlay: consolidate all debug UI into a removable floating panel
+
+**Firmware:** this commit
+**Why:** Adding `CMD_DEBUG_FIRE` (0x1B) and `CMD_DEBUG_HIT` (0x1C) so a
+bare second Pro Micro (no trigger, no IR LED, no vest) can participate
+in IR + mesh testing. Rather than scatter buttons through existing
+views, want one floating overlay that holds **every** debug surface
+the app currently has (or grows) so it's a single-file strip-out when
+the test rig is no longer needed.
+
+**iOS changes:**
+
+- File: `laserTag/BLEManager.swift`
+  - Add `sendDebugFire()` → write `[0x1B]` to the emitter command char
+  - Add `sendDebugHit(shooterId: UInt8 = 0xFF)` → write `[0x1C, shooterId]`
+  - Mirror the existing `CMD_RESPAWN` / `CMD_RELOAD` write paths
+
+- File: `laserTag/DebugOverlay.swift` (new)
+  - Floating, draggable, semi-transparent panel pinned to a corner
+    (top-right default). Collapses to a small "DBG" pill when not in
+    use so it's out of the way.
+  - Contents (consolidate from elsewhere — see "Move into overlay"
+    below):
+    - **Fire** button → `sendDebugFire()`
+    - **Sim Hit** button (with shooter-ID stepper, default 0xFF) →
+      `sendDebugHit(shooterId:)`
+    - **Emitter log** — embed `EmitterLogView`'s body, or factor it
+      into a reusable subview if it's currently tab-bound
+    - Any other developer-only controls scattered through the app
+  - Wrap the entire file in `#if DEBUG` so release builds don't ship it
+
+- File: `laserTag/ContentView.swift`
+  - Host `DebugOverlay` once at the root via `.overlay(alignment: …)`
+    so it floats above every phase (lobby, pairing, game, training).
+    Single hosting point — making the whole overlay removable in one
+    file delete + one line removed here.
+
+- **Move into overlay (delete from current homes):**
+  - `DashboardView.swift` — remove the "Logs" tab and the
+    `case .emitterLog: "Emitter Log"` line if it's only used by that
+    tab. Tab bar drops from 5 to 4.
+  - `FreePracticeView.swift` — remove the `#if DEBUG` mock-hit button;
+    Sim Hit in the overlay replaces it.
+  - Audit for any other DEBUG-gated buttons / dev-only sheets and
+    fold them into the overlay too.
+
+**Notes / gotchas:**
+
+- Goal is "one commit to remove the test rig." Resist the temptation
+  to add debug logic anywhere except `DebugOverlay.swift` +
+  `BLEManager.swift` send helpers.
+- `CMD_DEBUG_FIRE` has no ack — phone observes the effect via the
+  next `RSP_STATE_UPDATE` (mag ammo decrement).
+- `CMD_DEBUG_HIT` has no ack either — observed via `RSP_STATE_UPDATE`
+  (health decrement) and optionally `RSP_DEATH_NOTIFY` if it kills.
+- Firmware gates both commands behind `current_state ==
+  EMITTER_GAME_ACTIVE` (Fire) or `EMITTER_GAME_ACTIVE`/`EMITTER_DEAD`
+  (Hit, via `on_vest_hit`). The overlay should reflect this — buttons
+  disabled outside an active game, with a hint about why.
 
 ---
 

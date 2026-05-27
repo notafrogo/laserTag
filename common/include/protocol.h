@@ -21,6 +21,8 @@
 #define CMD_UNPAIR_VEST         0x18
 #define CMD_RESPAWN             0x19
 #define CMD_RELOAD              0x1A
+#define CMD_DEBUG_FIRE          0x1B  /* no payload — synth trigger pull */
+#define CMD_DEBUG_HIT           0x1C  /* payload: shooter_id[1] (optional, default 0xFF) */
 
 /* ===== Emitter -> Phone Opcodes (notify on TX) ===== */
 #define RSP_CONFIG_ACK          0x81
