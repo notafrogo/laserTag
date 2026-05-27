@@ -7,15 +7,14 @@
     gpio_keys {
         compatible = "gpio-keys";
         trigger_button: trigger_button {
-            /* Trigger switch is on P0.29, wired between pin and GND.
-             * ACTIVE_LOW + PULL_UP means: idle = pin HIGH (logical 0 =
-             * not pressed), press = pin pulled to GND (logical 1 =
-             * pressed). The prior ACTIVE_HIGH + PULL_UP combo with the
-             * same physical wiring inverted the read, so the firmware
-             * saw the release edge as a press and a bounce during the
-             * physical press as a second press — fired twice per pull.
+            /* Trigger switch is on P0.29, wired between pin and VCC.
+             * Internal pull-down holds pin LOW at idle; pressing the
+             * button shorts the pin to VCC = HIGH = "active" per
+             * GPIO_ACTIVE_HIGH. This matches the original wiring;
+             * earlier attempts to switch to PULL_UP / ACTIVE_LOW
+             * assumed button-to-GND which this hardware isn't.
              */
-            gpios = <&gpio0 29 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+            gpios = <&gpio0 29 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
             label = "Trigger Button";
         };
     };
