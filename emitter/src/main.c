@@ -201,7 +201,29 @@ static void apply_game_config(const uint8_t *data, uint16_t len)
         pos += name_len;
     }
 
-    /* Build friendly list: players on same team */
+    /* Pass 1: adopt our host-assigned team from the roster. A joiner sets
+     * team 0 at join time; the authoritative team assignment lives in the
+     * host's config. Do this before building the friendly list so the
+     * comparison below uses the correct team. */
+    uint16_t scan = pos;
+    for (int i = 0; i < n_players; i++) {
+        if (scan + 3 > len) {
+            return;
+        }
+        uint8_t pid = data[scan++];
+        uint8_t tid = data[scan++];
+        uint8_t ulen = data[scan++];
+        if (scan + ulen > len) {
+            return;
+        }
+        scan += ulen;
+        if (pid == local_player.player_id) {
+            local_player.team_id = tid;
+        }
+    }
+    mesh_set_identity(local_player.player_id, local_player.team_id);
+
+    /* Pass 2: build friendly list (players on our team). */
     friendly_count = 0;
     uint16_t player_section = pos;
     for (int i = 0; i < n_players; i++) {
@@ -231,6 +253,49 @@ static void apply_game_config(const uint8_t *data, uint16_t len)
         cfg.user_id = local_player.player_id;
         game_state_set_config(&cfg);
     }
+}
+
+/* Shared game-start path: apply a raw game-config blob, start the local game
+ * state, push friendly-list/fire to the vest, and kick off the periodic
+ * broadcasts. Used by both the host's CMD_BROADCAST_GAME_CFG handler and the
+ * joiner's mesh-driven self-start. Does NOT re-broadcast MESH_GAME_START — the
+ * caller owns that decision (host broadcasts; joiner relies on mesh relay). */
+static void start_game_local(const uint8_t *cfg, uint16_t len)
+{
+    if (len > sizeof(game_config_raw)) {
+        len = sizeof(game_config_raw);
+    }
+    game_config_raw_len = len;
+    memcpy(game_config_raw, cfg, len);
+
+    apply_game_config(game_config_raw, game_config_raw_len);
+    game_state_start_game();
+    current_state = EMITTER_GAME_ACTIVE;
+
+    if (ble_vest_is_connected()) {
+        ble_vest_send_friendly_list(friendly_ids, friendly_count);
+        const struct emitter_config *cfg_active = game_state_get_config();
+        ble_vest_send_friendly_fire(cfg_active->friendly_fire);
+    }
+
+    send_state_update();
+    k_work_reschedule(&player_state_work, K_MSEC(3000));
+    k_work_reschedule(&scoreboard_work, K_MSEC(10000));
+}
+
+/* Registered with mesh_set_game_start_cb. Fires when a peer's MESH_GAME_START
+ * arrives so a joiner's emitter self-starts the game. Runs in the BT RX
+ * context (same as the relay path), so only does state mutation + GATT writes
+ * already proven safe from there. The phone learns of the start via the
+ * forwarded 0x05 frame and navigates itself — no ack needed here. */
+static void on_mesh_game_start(const uint8_t *cfg, uint16_t len)
+{
+    if (current_state == EMITTER_GAME_ACTIVE || current_state == EMITTER_DEAD) {
+        return;
+    }
+    PLOG_INF("Mesh game start: joining game");
+    k_work_cancel_delayable(&lobby_announce_work);
+    start_game_local(cfg, len);
 }
 
 /* ===== Vest Hit Callback ===== */
@@ -606,25 +671,34 @@ static void on_phone_rx(const uint8_t *data, uint16_t len)
 
     case CMD_BROADCAST_GAME_CFG:
         if (len > 1) {
-            game_config_raw_len = len - 1;
-            memcpy(game_config_raw, &data[1], game_config_raw_len);
-
-            apply_game_config(game_config_raw, game_config_raw_len);
-            game_state_start_game();
-            current_state = EMITTER_GAME_ACTIVE;
-
+            k_work_cancel_delayable(&lobby_announce_work);
+            start_game_local(&data[1], len - 1);
             mesh_broadcast_game_start(game_config_raw, game_config_raw_len, 5);
-
-            if (ble_vest_is_connected()) {
-                ble_vest_send_friendly_list(friendly_ids, friendly_count);
-                const struct emitter_config *cfg = game_state_get_config();
-                ble_vest_send_friendly_fire(cfg->friendly_fire);
-            }
-
             phone_ack(RSP_GAME_CFG_ACK);
-            send_state_update();
-            k_work_reschedule(&player_state_work, K_MSEC(3000));
-            k_work_reschedule(&scoreboard_work, K_MSEC(10000));
+        }
+        break;
+
+    case CMD_BROADCAST_LOBBY_JOIN:
+        /* Joiner: re-broadcast our join over the mesh so the host's emitter
+         * forwards it up to the host phone. Layout: lobby_code[4] + pid[1] +
+         * username[]. */
+        if (len >= 6) {
+            uint32_t code = sys_get_le32(&data[1]);
+            uint8_t pid = data[5];
+            char name[MAX_USERNAME_LEN + 1];
+            uint8_t name_len = len - 6;
+            if (name_len > MAX_USERNAME_LEN) name_len = MAX_USERNAME_LEN;
+            memcpy(name, &data[6], name_len);
+            name[name_len] = '\0';
+            mesh_broadcast_lobby_join(code, pid, name);
+        }
+        break;
+
+    case CMD_BROADCAST_LOBBY_STATE:
+        /* Host: broadcast the roster so joiners sync their player list.
+         * Payload is already in MESH_LOBBY_STATE layout. */
+        if (len > 1) {
+            mesh_broadcast_lobby_state(&data[1], len - 1, 3);
         }
         break;
 
@@ -962,6 +1036,7 @@ int main(void)
 
     /* Mesh */
     mesh_init();
+    mesh_set_game_start_cb(on_mesh_game_start);
 
     /* Vest BLE central */
     ble_vest_init(on_vest_hit, on_vest_connected, on_vest_disconnected,

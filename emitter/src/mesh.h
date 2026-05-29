@@ -20,8 +20,19 @@ void mesh_broadcast_lobby_announce(uint32_t lobby_code, uint8_t game_mode,
                                    const char *host_name, uint8_t player_count);
 void mesh_broadcast_lobby_join(uint32_t lobby_code, uint8_t player_id,
                                const char *username);
+/* Roster sync from host. roster bytes = lobby_code[4] + N×[pid,tid,nameLen,name],
+ * built phone-side and wrapped here in a MESH_LOBBY_STATE frame. */
+void mesh_broadcast_lobby_state(const uint8_t *roster, uint16_t roster_len,
+                                uint8_t repeat_count);
 void mesh_broadcast_game_start(const uint8_t *config_data, uint16_t config_len,
                                uint8_t repeat_count);
+
+/* Fired from mesh_process_received when a peer's MESH_GAME_START arrives
+ * (non-origin, post-dedup) so the joiner's emitter can self-start the game
+ * locally. cfg points at the raw game-config bytes (same layout as the
+ * CMD_BROADCAST_GAME_CFG payload). */
+typedef void (*mesh_game_start_cb_t)(const uint8_t *cfg, uint16_t len);
+void mesh_set_game_start_cb(mesh_game_start_cb_t cb);
 void mesh_broadcast_player_state(uint8_t player_id, uint8_t team_id,
                                  int32_t lat, int32_t lon,
                                  uint8_t health, uint8_t ammo_pct,

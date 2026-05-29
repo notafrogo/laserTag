@@ -23,6 +23,8 @@
 #define CMD_RELOAD              0x1A
 #define CMD_DEBUG_FIRE          0x1B  /* no payload — synth trigger pull */
 #define CMD_DEBUG_HIT           0x1C  /* payload: shooter_id[1] (optional, default 0xFF) */
+#define CMD_BROADCAST_LOBBY_JOIN  0x1D  /* payload: lobby_code[4] + player_id[1] + username[] */
+#define CMD_BROADCAST_LOBBY_STATE 0x1E  /* payload: lobby_code[4] + N×[pid,tid,nameLen,name] */
 
 /* ===== Emitter -> Phone Opcodes (notify on TX) ===== */
 #define RSP_CONFIG_ACK          0x81

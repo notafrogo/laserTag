@@ -14,6 +14,7 @@ static uint8_t local_player_id;
 static uint8_t local_team_id;
 static struct bt_conn *phone_conn;
 static uint16_t seq_counter;
+static mesh_game_start_cb_t game_start_cb;
 
 /* ===== Coded PHY Advertising Set ===== */
 static struct bt_le_ext_adv *coded_adv_set;
@@ -291,6 +292,11 @@ void mesh_set_identity(uint8_t player_id, uint8_t team_id)
     local_team_id = team_id;
 }
 
+void mesh_set_game_start_cb(mesh_game_start_cb_t cb)
+{
+    game_start_cb = cb;
+}
+
 void mesh_set_phone_conn(struct bt_conn *conn)
 {
     phone_conn = conn;
@@ -317,12 +323,16 @@ void mesh_broadcast_raw(const uint8_t *data, uint16_t len)
 void mesh_broadcast_lobby_announce(uint32_t lobby_code, uint8_t game_mode,
                                    const char *host_name, uint8_t player_count)
 {
+    /* Wire layout (matches iOS handleLobbyAnnounce):
+     * lobby_code[4] + game_mode[1] + name_len[1] + name[name_len] + player_count[1]
+     */
     uint8_t payload[32];
     uint8_t idx = 0;
     sys_put_le32(lobby_code, &payload[idx]); idx += 4;
     payload[idx++] = game_mode;
     uint8_t name_len = strlen(host_name);
     if (name_len > 16) name_len = 16;
+    payload[idx++] = name_len;
     memcpy(&payload[idx], host_name, name_len); idx += name_len;
     payload[idx++] = player_count;
 
@@ -336,14 +346,30 @@ void mesh_broadcast_lobby_announce(uint32_t lobby_code, uint8_t game_mode,
 void mesh_broadcast_lobby_join(uint32_t lobby_code, uint8_t player_id,
                                const char *username)
 {
+    /* Wire layout (matches iOS handleLobbyJoin):
+     * lobby_code[4] + player_id[1] + name_len[1] + name[name_len]
+     */
     uint8_t payload[32];
     uint8_t idx = 0;
     sys_put_le32(lobby_code, &payload[idx]); idx += 4;
     payload[idx++] = player_id;
     uint8_t name_len = strlen(username);
     if (name_len > 16) name_len = 16;
+    payload[idx++] = name_len;
     memcpy(&payload[idx], username, name_len); idx += name_len;
     broadcast_with_repeat(MESH_LOBBY_JOIN, payload, idx, 3);
+}
+
+void mesh_broadcast_lobby_state(const uint8_t *roster, uint16_t roster_len,
+                                uint8_t repeat_count)
+{
+    /* roster is built phone-side and already has the exact MESH_LOBBY_STATE
+     * payload layout (lobby_code[4] + N×[pid,tid,nameLen,name]); we just wrap
+     * it in a mesh frame with our origin id + monotonic seq. */
+    if (roster_len == 0 || roster_len > 250) {
+        return;
+    }
+    broadcast_with_repeat(MESH_LOBBY_STATE, roster, (uint8_t)roster_len, repeat_count);
 }
 
 void mesh_broadcast_game_start(const uint8_t *config_data, uint16_t config_len,
@@ -464,6 +490,15 @@ void mesh_process_received(const uint8_t *data, uint16_t len, int8_t rssi)
             should_relay = false;
             should_forward = false;
         }
+    }
+
+    /* Joiner self-start: a peer's GAME_START carries the full game config.
+     * Apply it locally so this emitter enters its active game state without a
+     * phone round-trip. Fires once per unique frame (dedup-gated above). The
+     * normal relay below still propagates the frame to further-hop peers. */
+    if (hdr.mesh_type == MESH_GAME_START && game_start_cb &&
+        MESH_HEADER_SIZE + hdr.payload_len <= len) {
+        game_start_cb(&data[MESH_HEADER_SIZE], hdr.payload_len);
     }
 
     if (should_forward) {

@@ -128,6 +128,52 @@ the test rig is no longer needed.
 
 ## Applied
 
+### Firmware `this commit` → iOS (companion commit, same session): Multiplayer lobby/join/start wiring
+
+**Why:** Full end-to-end wiring of host-broadcast → join → roster-sync →
+game-start across both repos. Two new phone→emitter opcodes plus a
+mesh name-length format fix. iOS side was implemented in the same
+session, so this lands as Applied rather than Pending.
+
+**Firmware changes:**
+- `protocol.h` — `CMD_BROADCAST_LOBBY_JOIN = 0x1D`
+  (payload: `lobby_code[4 LE] + player_id[1] + username[]`),
+  `CMD_BROADCAST_LOBBY_STATE = 0x1E`
+  (payload: `lobby_code[4 LE] + N×[pid, teamId, nameLen, name]`)
+- `mesh.c` — fixed `mesh_broadcast_lobby_announce` /
+  `mesh_broadcast_lobby_join` to write the `name_len` byte BEFORE the
+  name (iOS parsers read `nameLen` at `payload[5]`). Added
+  `mesh_broadcast_lobby_state` + a `MESH_GAME_START` receive callback so
+  a joiner's emitter self-starts the game without a phone round-trip.
+- `main.c` — `CMD_BROADCAST_LOBBY_JOIN` / `CMD_BROADCAST_LOBBY_STATE`
+  handlers; two-pass `apply_game_config` that adopts the local player's
+  host-assigned team from the roster; `start_game_local` helper shared
+  by phone-driven start and mesh-driven joiner start.
+
+**iOS changes applied:**
+- `Models.swift` — `LobbyCommand.broadcastLobbyJoin(lobbyCode:playerId:username:)`
+  (→ `[0x1D]`) and `.broadcastLobbyState(Data)` (→ `[0x1E]`) serialize cases.
+- `GameManager.swift` — `onRosterChanged` callback +
+  `buildLobbyStatePayload()`; `handleLobbyJoin` pushes roster via
+  `onRosterChanged`; `case .gameStart` → `handleGameStart` parses the
+  config (`parseGameConfig`) and starts the local game; `joinLobby(_:)`
+  seeds the joined roster.
+- `ContentView.swift` — wires `onRosterChanged` →
+  `sendLobbyCommand(.broadcastLobbyState)`.
+- `HostLobbyView.swift` — onAppear sends `setPlayerInfo` +
+  `startLobbyBroadcast`; close button sends `stopLobby`.
+- `JoinLobbyView.swift` — scan via `sendLobbyCommand(.startLobbyScan)`;
+  lobby tap sends `setPlayerInfo` + `broadcastLobbyJoin`; joined
+  waiting-room UI; `.onChange(of: gameActive)` → primeEmitterState +
+  navigate to `.game`.
+
+**Notes / gotchas:**
+- Emitter is the sole mesh-frame originator per player (single
+  monotonic seq counter) to avoid dedup collisions.
+- Joiner self-starts on `MESH_GAME_START` without re-broadcasting;
+  relies on existing TTL relay to propagate. No re-broadcast storm.
+- Untested on hardware — only one assembled emitter rig exists.
+
 ### Firmware `81eb927` (iOS-only) → iOS `42c52ea`: Training mode mag-size bump
 
 **Why:** With the previous `TrainingSession` config (`magSize = 30`,
